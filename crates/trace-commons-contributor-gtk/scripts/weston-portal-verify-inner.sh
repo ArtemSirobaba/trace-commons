@@ -20,6 +20,13 @@ fail() {
   FAIL=1
 }
 
+# The default destination is Insights. Require its heading and an interactive
+# file-selection control, rather than OCR of a neighboring navigation tab.
+insights_frame() {
+  grep -qiE '^[[:space:]]*Insights[[:space:]]*$' <<< "$1" &&
+    grep -qi 'Choose file' <<< "$1"
+}
+
 # --- XDG_RUNTIME_DIR: weston's socket and the portal both want one --------
 
 if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ]; then
@@ -102,6 +109,21 @@ else
     fail "application shutdown did not retire pending startup"
   fi
 
+  # Insights must work before contributor state exists, and its bounded
+  # worker must not publish after a window is hidden or closed.
+  if ! WAYLAND_DISPLAY="$WAYLAND_SOCKET" GDK_BACKEND=wayland GSETTINGS_BACKEND=memory \
+      cargo test --locked --manifest-path "$GTK_MANIFEST" --lib \
+      ui::insights::tests::account_free_view_analyzes_saves_explains_deletes_and_ignores_closed_results \
+      -- --exact --ignored --test-threads=1; then
+    fail "local Insights lifecycle or close cancellation failed"
+  fi
+  if ! WAYLAND_DISPLAY="$WAYLAND_SOCKET" GDK_BACKEND=wayland GSETTINGS_BACKEND=memory \
+      cargo test --locked --manifest-path "$GTK_MANIFEST" --bin trace-commons-shell \
+      insights_startup_tests::first_run_local_window_does_not_create_contributor_state \
+      -- --exact --ignored --test-threads=1; then
+    fail "first-run Insights created contributor state"
+  fi
+
   # --- axis 2: a real portal daemon ------------------------------------------
   if ! WAYLAND_DISPLAY="$WAYLAND_SOCKET" GDK_BACKEND=wayland GSETTINGS_BACKEND=memory \
       cargo test --locked --manifest-path "$GTK_MANIFEST" --lib \
@@ -156,10 +178,13 @@ else
   (
     cd "$WORKDIR" || exit 1
     WAYLAND_DISPLAY="$WAYLAND_SOCKET" GDK_BACKEND=wayland GSETTINGS_BACKEND=memory \
-      "$SHELL_BIN" --state-dir "$TC_DIR" --exit-after-realize --realize-seconds 10 \
+      GSK_RENDERER=cairo "$SHELL_BIN" --state-dir "$TC_DIR" --exit-after-realize --realize-seconds 60 \
       >"$WORKDIR/app.log" 2>&1 &
     APP_PID=$!
 
+    # Use GTK's software renderer on a compositor with no GPU, and keep
+    # the app alive beyond all ten capture attempts. A ten-second lifetime
+    # could end before text was captured and leave only desktop screenshots.
     # Give the window time to realize and composite at least one frame
     # before asking the compositor for a screenshot.
     # Capture until the frame actually contains text, not once after a fixed
@@ -184,7 +209,8 @@ else
       WAYLAND_DISPLAY="$WAYLAND_SOCKET" weston-screenshooter || true
       CANDIDATE=$(ls -t "$WORKDIR"/*.png 2>/dev/null | head -1 || true)
       [ -z "$CANDIDATE" ] && continue
-      if tesseract "$CANDIDATE" - 2>/dev/null | grep -qi 'queue'; then
+      CANDIDATE_TEXT=$(tesseract "$CANDIDATE" - 2>/dev/null || true)
+      if insights_frame "$CANDIDATE_TEXT"; then
         echo "frame with readable text captured on attempt $attempt"
         CAPTURED=1
         break
@@ -200,6 +226,9 @@ else
 
   echo "--- application log ---"
   cat "$WORKDIR/app.log" 2>/dev/null || true
+  if grep -q "panicked at" "$WORKDIR/app.log"; then
+    fail "application background thread panicked during desktop smoke"
+  fi
   echo "-----------------------"
 
   SHOT=$(ls -t "$WORKDIR"/*.png 2>/dev/null | head -1 || true)
@@ -227,10 +256,10 @@ else
       echo "--- OCR text ---"
       echo "$OCR_TEXT"
       echo "----------------"
-      if echo "$OCR_TEXT" | grep -qi 'Queue'; then
-        echo "OCR found the expected header-bar text (Queue)"
+      if insights_frame "$OCR_TEXT"; then
+        echo "OCR found the Insights heading and Choose file control"
       else
-        fail "OCR did not find the expected header-bar text (Queue) in the screenshot"
+        fail "OCR did not find the Insights heading and Choose file control in the screenshot"
       fi
     else
       fail "tesseract not available -- OCR text-presence check could not run"
