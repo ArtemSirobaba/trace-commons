@@ -18,6 +18,18 @@ fn report() -> outcomes::OutcomeEvidence {
     )
 }
 
+fn codex_source(path: &Path) {
+    fs::write(
+        path,
+        concat!(
+            "{\"type\":\"session_meta\",\"timestamp\":\"2026-09-11T00:00:00Z\",\"payload\":{\"id\":\"fixture\",\"model_provider\":\"openai\"}}\n",
+            "{\"type\":\"turn_context\",\"timestamp\":\"2026-09-11T00:00:01Z\",\"payload\":{\"model\":\"fixture-model\"}}\n",
+            "{\"type\":\"response_item\",\"timestamp\":\"2026-09-11T00:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n"
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn explicit_links_deduplicate_follow_exact_content_and_do_not_upgrade_outcomes() {
     let temp = tempfile::tempdir().unwrap();
@@ -184,6 +196,120 @@ fn legacy_v4_mutation_preserves_existing_evidence_and_episodes_without_inventing
         serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
     assert_eq!(migrated["version"], super::STORE_VERSION);
     assert!(migrated["reports"][&saved.id]["time_evidence"].is_null());
+}
+
+/// A nested model-observation schema above the legacy shape is only readable
+/// in a store at the floor version. Without that coupling an older client
+/// accepts the store and then rejects individual snapshots one at a time.
+#[test]
+fn a_post_legacy_model_schema_requires_the_store_version_floor() {
+    const {
+        assert!(
+            super::STORE_VERSION >= models::MODEL_OBSERVATIONS_STORE_VERSION_FLOOR,
+            "STORE_VERSION must advance with the nested model-observation schema"
+        );
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("source.jsonl");
+    codex_source(&file);
+    let store = LocalInsightStore::open(&temp.path().join("store")).unwrap();
+    let saved = store.import(SourceFormat::Codex, &file).unwrap();
+    assert_eq!(saved.model_observations.as_ref().unwrap().schema_version, 2);
+
+    let index_path = store.dir.join("index.json");
+    let current: serde_json::Value =
+        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    assert_eq!(current["version"], super::STORE_VERSION);
+
+    let mut below = current.clone();
+    below["version"] = (models::MODEL_OBSERVATIONS_STORE_VERSION_FLOOR - 1).into();
+    fs::write(&index_path, serde_json::to_vec(&below).unwrap()).unwrap();
+    super::assert_quarantined(
+        &store,
+        &saved.id,
+        "a schema 2 model observation below the floor",
+    );
+
+    let mut legacy = below.clone();
+    legacy["reports"][&saved.id]["model_observations"]["schema_version"] = 1.into();
+    fs::write(&index_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert_eq!(
+        store.list().unwrap()[0]
+            .model_observations
+            .as_ref()
+            .unwrap()
+            .schema_version,
+        1,
+        "the legacy shape stays readable below the floor"
+    );
+
+    let mut future = current;
+    future["version"] = (super::STORE_VERSION + 1).into();
+    fs::write(&index_path, serde_json::to_vec(&future).unwrap()).unwrap();
+    assert_eq!(
+        store.list().unwrap_err().to_string(),
+        "insights_store_version_unsupported",
+        "one diagnosable refusal of the whole store, not a per-snapshot reject"
+    );
+}
+
+#[test]
+fn legacy_model_schema_is_preserved_until_explicit_identical_content_reimport() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("source.jsonl");
+    codex_source(&file);
+    let store = LocalInsightStore::open(&temp.path().join("store")).unwrap();
+    let saved = store.import(SourceFormat::Codex, &file).unwrap();
+    let observations = saved.model_observations.as_ref().unwrap();
+    assert_eq!(observations.schema_version, 2);
+    assert_eq!(observations.candidate_records, 1);
+    assert_eq!(observations.valid_declarations, 1);
+    assert_eq!(observations.missing_declarations, 0);
+
+    let index_path = store.dir.join("index.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+    legacy["reports"][&saved.id]["model_observations"]["schema_version"] = 1.into();
+    fs::write(&index_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    let before = fs::read(&index_path).unwrap();
+    assert_eq!(
+        store.list().unwrap()[0]
+            .model_observations
+            .as_ref()
+            .unwrap()
+            .schema_version,
+        1
+    );
+    let annotated = store
+        .annotate(&saved.id, TaskCategory::Debugging, TaskOutcome::Partial)
+        .unwrap();
+    assert_eq!(
+        annotated
+            .model_observations
+            .as_ref()
+            .unwrap()
+            .schema_version,
+        1,
+        "ordinary mutation must not reinterpret recorded evidence"
+    );
+    assert_ne!(fs::read(&index_path).unwrap(), before);
+
+    let reimported = store.import(SourceFormat::Codex, &file).unwrap();
+    assert_eq!(reimported.id, saved.id);
+    assert_eq!(
+        reimported
+            .model_observations
+            .as_ref()
+            .unwrap()
+            .schema_version,
+        2,
+        "explicit reimport must replace even identical-digest legacy evidence"
+    );
+    assert_eq!(
+        reimported.manual_annotation, annotated.manual_annotation,
+        "reimport retains the user's independent annotation"
+    );
 }
 
 #[test]

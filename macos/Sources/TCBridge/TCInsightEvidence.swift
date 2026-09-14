@@ -1,5 +1,17 @@
 import Foundation
 
+public struct ClaudeTaskAttributionEvidence: Decodable, Sendable {
+    public let schema_version, extractor_version: UInt32
+    public let profile_id, observed_writer_version, qualification_scope, source_digest: String
+    public let record_count, recognized_records: UInt64
+    public let root_session_identity_sha256, agent_branch_identity_sha256: String?
+    public let declared_model, model_selector, context_window_selector: String?
+    public let state: State
+    public struct State: Decodable, Sendable {
+        public let status: String
+    }
+}
+
 public struct InsightModelObservations: Decodable, Sendable {
     public let schema_version: UInt32
     public let scope: Scope
@@ -10,6 +22,16 @@ public struct InsightModelObservations: Decodable, Sendable {
     public let model_labels_omitted, mixed_declared_models: Bool
     public let declared_models: [String]
     public let declarations: [Declaration]
+    /// Rust's verdict, recomputed there on every response. This shell does not
+    /// re-derive the contract; an unknown value fails decoding, which is the
+    /// fail-closed answer for a contract newer than this build.
+    public let contract: Contract
+    public enum Contract: String, Decodable, Sendable {
+        case legacyDeclaredMetadataV1 = "legacy_declared_metadata_v1"
+        case codexTurnContextV2 = "codex_turn_context_v2"
+        case claudeAssistantMessageV3 = "claude_assistant_message_v3"
+        case unsupported
+    }
     public enum Scope: String, Decodable, Sendable {
         case declaredMetadataOnly = "declared_metadata_only"
     }
@@ -24,6 +46,7 @@ public struct InsightModelObservations: Decodable, Sendable {
         public var id: UInt64 { record_index }
     }
     public enum Kind: String, Decodable, Sendable {
+        case claudeAssistantMessage = "claude_assistant_message"
         case codexSessionMetadata = "codex_session_metadata"
         case codexTurnContext = "codex_turn_context"
         case codexAssistantMessage = "codex_assistant_message"
@@ -67,7 +90,19 @@ public struct InsightOutcomeLink: Decodable, Sendable, Identifiable {
 
 extension LocalInsight {
     func validateSupportedEvidence() throws {
-        if let models = model_observations, models.schema_version != 1 {
+        if let attribution = claude_task_attribution {
+            guard source_format == "claude_code", attribution.schema_version == 1,
+                  attribution.extractor_version == 1,
+                  attribution.profile_id == "claude-code-v2.1.260-observed-agent-branch-v1",
+                  attribution.observed_writer_version == "2.1.260",
+                  attribution.qualification_scope == "observed_writer_agent_branch_records",
+                  attribution.record_count > 0,
+                  attribution.recognized_records <= attribution.record_count,
+                  ["attributed", "unavailable"].contains(attribution.state.status) else {
+                throw InsightsError.invalidResponse
+            }
+        }
+        if let models = model_observations, models.contract == .unsupported {
             throw InsightsError.invalidResponse
         }
         for link in outcome_links ?? [] {

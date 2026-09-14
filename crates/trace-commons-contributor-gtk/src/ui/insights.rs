@@ -7,6 +7,8 @@ use std::{
     path::PathBuf,
     rc::Rc,
 };
+use trace_commons_contributor::insights::card_presentation::question_copy;
+use trace_commons_contributor::insights::card_store::CardStoreError;
 use trace_commons_contributor::insights::service::{
     self, LocalInsightsOperation as Op, LocalInsightsRequest, LocalInsightsResponse as Response,
 };
@@ -20,6 +22,7 @@ use trace_commons_contributor::insights::{
         EpisodeDetail, EpisodeListEntry, EpisodeOverlap, EpisodeValidationError, LocalEpisode,
     },
 };
+use trace_commons_protocol::insights_cards::{InsightCardResult, InsightQuestionId};
 
 #[path = "insights_evidence.rs"]
 mod evidence;
@@ -54,6 +57,32 @@ impl EpisodeDraftTicket {
 struct EpisodeReadTicket {
     generation: u64,
     requested_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CardRequestTicket {
+    generation: u64,
+    snapshot_ids: Vec<String>,
+    episode_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CardPanelState {
+    Empty,
+    Loading,
+    Presented,
+    Failed,
+}
+
+fn accept_card_completion(
+    current_generation: u64,
+    snapshot_ids: &[String],
+    episode_ids: &[String],
+    ticket: &CardRequestTicket,
+) -> bool {
+    current_generation == ticket.generation
+        && snapshot_ids == ticket.snapshot_ids
+        && episode_ids == ticket.episode_ids
 }
 impl EpisodeReadTicket {
     fn accepts(&self, generation: u64, returned_id: Option<&str>) -> bool {
@@ -134,6 +163,16 @@ pub struct InsightsView {
     episode_category: gtk::DropDown,
     episode_outcome: gtk::DropDown,
     episode_success_notice: RefCell<Option<String>>,
+    card_generation: Cell<u64>,
+    card_questions: Vec<(InsightQuestionId, gtk::CheckButton)>,
+    card_snapshot_choices: RefCell<Vec<(String, gtk::CheckButton)>>,
+    card_snapshot_choices_box: gtk::Box,
+    card_episode_choices: RefCell<Vec<(String, gtk::CheckButton)>>,
+    card_episode_choices_box: gtk::Box,
+    card_status: gtk::Label,
+    card_result: gtk::Label,
+    card_evidence: gtk::Box,
+    card_state: Cell<CardPanelState>,
     flight: RefCell<Flight>,
     store_dir: Option<PathBuf>,
 }
@@ -170,7 +209,8 @@ impl InsightsView {
         root.append(&label(copy("intro")));
         root.append(&label(copy("snapshot_notice")));
         let controls = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        let source = gtk::DropDown::from_strings(&[copy("codex"), copy("trajectory")]);
+        let source =
+            gtk::DropDown::from_strings(&[copy("codex"), copy("claude_code"), copy("trajectory")]);
         source.set_tooltip_text(Some(copy("source")));
         let choose = gtk::Button::with_label(copy("choose_file"));
         let save = gtk::Button::with_label(copy("save"));
@@ -255,6 +295,39 @@ impl InsightsView {
             .child(&episode_body)
             .build();
         content.append(&episode_expander);
+        let card_body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        card_body.append(&label(copy("card_selection_notice")));
+        let card_questions_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let card_questions = InsightQuestionId::ALL
+            .into_iter()
+            .map(|question| {
+                let choice = gtk::CheckButton::with_label(question_copy(question).1);
+                choice.set_active(true);
+                card_questions_box.append(&choice);
+                (question, choice)
+            })
+            .collect::<Vec<_>>();
+        card_body.append(&card_questions_box);
+        card_body.append(&label(copy("card_choose_evidence")));
+        card_body.append(&label(copy("saved")));
+        let card_snapshot_choices_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        card_body.append(&card_snapshot_choices_box);
+        card_body.append(&label(copy("episode_title")));
+        let card_episode_choices_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        card_body.append(&card_episode_choices_box);
+        let run_cards = gtk::Button::with_label(copy("card_update"));
+        card_body.append(&run_cards);
+        let card_status = label(copy("card_selection_notice"));
+        card_body.append(&card_status);
+        let card_result = label("");
+        card_body.append(&card_result);
+        let card_evidence = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        card_body.append(&card_evidence);
+        let card_expander = gtk::Expander::builder()
+            .label(copy("card_title"))
+            .child(&card_body)
+            .build();
+        content.append(&card_expander);
         let detail = label("");
         content.append(&detail);
         let evidence_body = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -352,10 +425,36 @@ impl InsightsView {
             episode_category,
             episode_outcome,
             episode_success_notice: RefCell::new(None),
+            card_generation: Cell::new(0),
+            card_questions,
+            card_snapshot_choices: RefCell::new(Vec::new()),
+            card_snapshot_choices_box,
+            card_episode_choices: RefCell::new(Vec::new()),
+            card_episode_choices_box,
+            card_status,
+            card_result,
+            card_evidence,
+            card_state: Cell::new(CardPanelState::Empty),
             flight: RefCell::new(Flight::default()),
             store_dir,
         });
         view.rebuild_episode_choices(&[], &view.episode_choices_box);
+        view.rebuild_card_snapshot_choices(&[]);
+        view.rebuild_card_episode_choices(&[]);
+        for (_, choice) in &view.card_questions {
+            let weak = Rc::downgrade(&view);
+            choice.connect_toggled(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.invalidate_cards();
+                }
+            });
+        }
+        let weak = Rc::downgrade(&view);
+        run_cards.connect_clicked(move |_| {
+            if let Some(view) = weak.upgrade() {
+                view.request_cards();
+            }
+        });
         let weak = Rc::downgrade(&view);
         create_episode.connect_clicked(move |_| {
             if let Some(view) = weak.upgrade() {
@@ -368,6 +467,7 @@ impl InsightsView {
                 view.mutation_notice.set_text("");
                 view.episode_success_notice.borrow_mut().take();
                 view.invalidate_episode_draft();
+                view.invalidate_cards();
                 view.refresh_episodes();
             }
         });
@@ -559,6 +659,7 @@ impl InsightsView {
                 view.episode_success_notice.borrow_mut().take();
                 view.invalidate_choosers();
                 view.invalidate_episode_draft();
+                view.invalidate_cards();
             }
             gtk::glib::Propagation::Proceed
         });
@@ -570,6 +671,7 @@ impl InsightsView {
                 view.episode_success_notice.borrow_mut().take();
                 view.invalidate_choosers();
                 view.invalidate_episode_draft();
+                view.invalidate_cards();
             }
         });
         let weak = Rc::downgrade(&view);
@@ -590,6 +692,7 @@ impl InsightsView {
             if let Some(view) = weak.upgrade() {
                 view.invalidate_choosers();
                 view.invalidate_episode_draft();
+                view.invalidate_cards();
                 view.flight.borrow_mut().cancelled = true;
             }
         });
@@ -631,10 +734,10 @@ impl InsightsView {
             self.clear_detail();
             self.request(
                 Op::Analyze {
-                    source: if self.source.selected() == 0 {
-                        SourceFormat::Codex
-                    } else {
-                        SourceFormat::Trajectory
+                    source: match self.source.selected() {
+                        0 => SourceFormat::Codex,
+                        1 => SourceFormat::ClaudeCode,
+                        _ => SourceFormat::Trajectory,
                     },
                     file,
                     save,
@@ -670,6 +773,194 @@ impl InsightsView {
         self.current_membership_revision.set(None);
         self.episode_detail.set_text("");
         self.episode_edit.set_visible(false);
+    }
+
+    fn invalidate_cards(&self) {
+        self.card_generation
+            .set(self.card_generation.get().wrapping_add(1));
+        self.card_result.set_text("");
+        while let Some(child) = self.card_evidence.first_child() {
+            self.card_evidence.remove(&child);
+        }
+        self.card_state.set(CardPanelState::Empty);
+        self.card_status.set_text(copy("card_selection_notice"));
+    }
+
+    fn selected_card_ids(values: &RefCell<Vec<(String, gtk::CheckButton)>>) -> Vec<String> {
+        values
+            .borrow()
+            .iter()
+            .filter(|(_, choice)| choice.is_active())
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn rebuild_card_snapshot_choices(self: &Rc<Self>, ids: &[String]) {
+        let selected: std::collections::BTreeSet<_> =
+            Self::selected_card_ids(&self.card_snapshot_choices)
+                .into_iter()
+                .collect();
+        while let Some(child) = self.card_snapshot_choices_box.first_child() {
+            self.card_snapshot_choices_box.remove(&child);
+        }
+        let mut choices = Vec::new();
+        for id in ids {
+            let choice = gtk::CheckButton::with_label(id);
+            choice.set_active(selected.contains(id));
+            choice.set_tooltip_text(Some(copy("summary_open_snapshot")));
+            let weak = Rc::downgrade(self);
+            choice.connect_toggled(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.invalidate_cards();
+                }
+            });
+            self.card_snapshot_choices_box.append(&choice);
+            choices.push((id.clone(), choice));
+        }
+        *self.card_snapshot_choices.borrow_mut() = choices;
+    }
+
+    fn rebuild_card_episode_choices(self: &Rc<Self>, ids: &[String]) {
+        let selected: std::collections::BTreeSet<_> =
+            Self::selected_card_ids(&self.card_episode_choices)
+                .into_iter()
+                .collect();
+        while let Some(child) = self.card_episode_choices_box.first_child() {
+            self.card_episode_choices_box.remove(&child);
+        }
+        let mut choices = Vec::new();
+        for id in ids {
+            let choice = gtk::CheckButton::with_label(id);
+            choice.set_active(selected.contains(id));
+            choice.set_tooltip_text(Some(copy("episode_id")));
+            let weak = Rc::downgrade(self);
+            choice.connect_toggled(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.invalidate_cards();
+                }
+            });
+            self.card_episode_choices_box.append(&choice);
+            choices.push((id.clone(), choice));
+        }
+        *self.card_episode_choices.borrow_mut() = choices;
+    }
+
+    fn request_cards(self: &Rc<Self>) {
+        let questions = self
+            .card_questions
+            .iter()
+            .filter(|(_, choice)| choice.is_active())
+            .map(|(question, _)| *question)
+            .collect::<Vec<_>>();
+        let snapshot_ids = Self::selected_card_ids(&self.card_snapshot_choices);
+        let episode_ids = Self::selected_card_ids(&self.card_episode_choices);
+        if questions.is_empty() {
+            self.card_state.set(CardPanelState::Failed);
+            self.card_status.set_text(copy("card_selection_notice"));
+            return;
+        }
+        if !self.flight.borrow_mut().begin() {
+            return;
+        }
+        let ticket = CardRequestTicket {
+            generation: self.card_generation.get(),
+            snapshot_ids: snapshot_ids.clone(),
+            episode_ids: episode_ids.clone(),
+        };
+        self.card_state.set(CardPanelState::Loading);
+        self.card_status.set_text(copy("working"));
+        self.card_result.set_text("");
+        let (tx, rx) = async_channel::bounded(1);
+        let store_dir = self.store_dir.clone();
+        std::thread::spawn(move || {
+            let result = match std::panic::catch_unwind(|| {
+                service::execute(LocalInsightsRequest {
+                    store_dir,
+                    operation: Op::QuestionCards {
+                        questions,
+                        snapshot_ids,
+                        episode_ids,
+                    },
+                })
+            }) {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(error)) => Err(card_error_copy_key(&error)),
+                Err(_) => Err("summary_unavailable"),
+            };
+            let _ = tx.send_blocking(result);
+        });
+        let weak = Rc::downgrade(self);
+        gtk::glib::spawn_future_local(async move {
+            let response = rx.recv().await.ok();
+            let Some(view) = weak.upgrade() else { return };
+            if !view.flight.borrow_mut().finish()
+                || !accept_card_completion(
+                    view.card_generation.get(),
+                    &Self::selected_card_ids(&view.card_snapshot_choices),
+                    &Self::selected_card_ids(&view.card_episode_choices),
+                    &ticket,
+                )
+            {
+                return;
+            }
+            match response {
+                Some(Ok(Response::QuestionCards { result, text })) => {
+                    view.present_cards(&result, &text);
+                    view.card_state.set(CardPanelState::Presented);
+                    view.card_status.set_text(copy("refreshed"));
+                }
+                Some(Err(key)) => {
+                    view.card_state.set(CardPanelState::Failed);
+                    view.card_result.set_text("");
+                    view.card_status.set_text(copy(key));
+                }
+                _ => {
+                    view.card_state.set(CardPanelState::Failed);
+                    view.card_result.set_text("");
+                    view.card_status.set_text(copy("summary_unavailable"));
+                }
+            }
+        });
+    }
+
+    fn present_cards(self: &Rc<Self>, result: &InsightCardResult, text: &str) {
+        self.card_result.set_text(text);
+        while let Some(child) = self.card_evidence.first_child() {
+            self.card_evidence.remove(&child);
+        }
+        let evidence_ids = result
+            .cards
+            .iter()
+            .flat_map(|card| card.evidence_ids.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        for id in evidence_ids {
+            let button =
+                gtk::Button::with_label(&format!("{}: {id}", copy("summary_open_snapshot")));
+            let weak = Rc::downgrade(self);
+            let id = id.clone();
+            button.connect_clicked(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.request(Op::Explain { id: id.clone() }, true);
+                }
+            });
+            self.card_evidence.append(&button);
+        }
+        let episode_ids = result
+            .cards
+            .iter()
+            .flat_map(|card| card.episode_ids.iter())
+            .collect::<std::collections::BTreeSet<_>>();
+        for id in episode_ids {
+            let button = gtk::Button::with_label(&format!("{}: {id}", copy("episode_open")));
+            let weak = Rc::downgrade(self);
+            let id = id.clone();
+            button.connect_clicked(move |_| {
+                if let Some(view) = weak.upgrade() {
+                    view.open_episode(id.clone());
+                }
+            });
+            self.card_evidence.append(&button);
+        }
     }
 
     fn episode_ticket(&self) -> EpisodeDraftTicket {
@@ -832,6 +1123,9 @@ impl InsightsView {
                 | Op::EpisodeClearAssessment { .. }
                 | Op::EpisodeDelete { .. }
         );
+        if mutation {
+            self.invalidate_cards();
+        }
         let read_ticket = (!mutation).then(|| EpisodeReadTicket {
             generation: self.episode_generation.get(),
             requested_id: match &operation {
@@ -941,7 +1235,7 @@ impl InsightsView {
                     view.set_episode_success(copy("episode_create_success"));
                     view.refresh_episodes();
                 }
-                EpisodeResult::Response(Response::EpisodeReplaceMembers { episode }) => {
+                EpisodeResult::Response(Response::EpisodeReplaceMembers { episode, .. }) => {
                     let membership_changed =
                         view.current_membership_revision.get() != Some(episode.membership_revision);
                     view.present_episode(&episode);
@@ -956,12 +1250,12 @@ impl InsightsView {
                     }
                     view.refresh_episodes();
                 }
-                EpisodeResult::Response(Response::EpisodeAnnotate { episode }) => {
+                EpisodeResult::Response(Response::EpisodeAnnotate { episode, .. }) => {
                     view.present_episode(&episode);
                     view.set_episode_success(copy("episode_assessment_saved"));
                     view.refresh_episodes();
                 }
-                EpisodeResult::Response(Response::EpisodeClearAssessment { episode }) => {
+                EpisodeResult::Response(Response::EpisodeClearAssessment { episode, .. }) => {
                     view.present_episode(&episode);
                     view.set_episode_success(copy("episode_assessment_cleared"));
                     view.refresh_episodes();
@@ -1017,6 +1311,12 @@ impl InsightsView {
             copy("episode_count"),
             entries.len()
         )));
+        self.rebuild_card_episode_choices(
+            &entries
+                .iter()
+                .map(|entry| entry.episode.id.clone())
+                .collect::<Vec<_>>(),
+        );
         if entries.is_empty() {
             self.episodes.append(&label(copy("episode_empty")));
             return;
@@ -1168,6 +1468,11 @@ impl InsightsView {
         self.evidence_body.append(&label(&evidence::render_models(
             insight.model_observations.as_ref(),
         )));
+        if let Some(attribution) =
+            evidence::render_claude_attribution(insight.claude_task_attribution.as_ref())
+        {
+            self.evidence_body.append(&label(&attribution));
+        }
         self.evidence_body
             .append(&label(copy("linked_evidence_title")));
         self.evidence_body.append(&label(copy("link_notice")));
@@ -1286,6 +1591,9 @@ impl InsightsView {
         );
         let history_read = matches!(&operation, Op::Summary {} | Op::List {});
         let mutates_history = refresh_saved || matches!(&operation, Op::Delete { .. });
+        if mutates_history {
+            self.invalidate_cards();
+        }
         if history_read || mutates_history {
             self.clear_summary();
         }
@@ -1449,7 +1757,9 @@ impl InsightsView {
             .iter()
             .map(|snapshot| snapshot.id.clone())
             .collect::<Vec<_>>();
+        self.invalidate_cards();
         self.rebuild_episode_choices(&ids, &self.episode_choices_box);
+        self.rebuild_card_snapshot_choices(&ids);
         self.render_saved(summary.snapshots.iter());
         for category in &summary.user_reported.categories {
             self.evidence_button(
@@ -1596,6 +1906,16 @@ fn episode_error_copy_key(error: &anyhow::Error) -> &'static str {
         return "episode_response_too_large";
     }
     "episode_detail_unavailable"
+}
+fn card_error_copy_key(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error.downcast_ref::<CardStoreError>() {
+        return match error {
+            CardStoreError::SnapshotLimit => "card_snapshot_limit",
+            CardStoreError::EpisodeLimit => "card_episode_limit",
+            _ => "summary_unavailable",
+        };
+    }
+    "summary_unavailable"
 }
 fn episode_failure_status(committed: Option<&str>, error: &str) -> String {
     committed
@@ -1870,8 +2190,17 @@ fn render(insight: &LocalInsight) -> String {
 fn source_label(source: SourceFormat) -> &'static str {
     copy(match source {
         SourceFormat::Codex => "codex",
+        SourceFormat::ClaudeCode => "claude_code",
         SourceFormat::Trajectory => "trajectory",
     })
+}
+#[cfg(test)]
+fn source_index(source: SourceFormat) -> u32 {
+    match source {
+        SourceFormat::Codex => 0,
+        SourceFormat::ClaudeCode => 1,
+        SourceFormat::Trajectory => 2,
+    }
 }
 fn category_label(category: TaskCategory) -> &'static str {
     copy(match category {
@@ -1901,27 +2230,72 @@ pub fn present_local<F: Fn() + 'static>(application: &adw::Application, contribu
         .default_width(840)
         .default_height(760)
         .build();
-    let page = InsightsView::new(&window);
+    let stack = local_first_stack(&window);
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
     let button = gtk::Button::with_label(copy("contributions"));
     header.pack_start(&button);
+    let switcher = adw::ViewSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    header.set_title_widget(Some(&switcher));
     content.append(&header);
-    content.append(&page.root);
+    content.append(&stack);
+    stack.set_vexpand(true);
     window.set_content(Some(&content));
     button.connect_clicked(move |_| contribute());
     window.present();
 }
 
+pub(super) fn local_first_stack(window: &adw::ApplicationWindow) -> adw::ViewStack {
+    let stack = adw::ViewStack::new();
+    let insights = InsightsView::new(window);
+    let missions = super::mission_drafts::MissionDraftsView::new(window);
+    stack
+        .add_titled(&insights.root, Some("insights"), copy("title"))
+        .set_icon_name(Some("view-statistics-symbolic"));
+    let mission_title = trace_commons_contributor::mission_draft_service::ui_copy()
+        .remove("title")
+        .expect("shared mission draft title");
+    stack
+        .add_titled(&missions.root, Some("mission-drafts"), &mission_title)
+        .set_icon_name(Some("document-edit-symbolic"));
+    stack.set_visible_child_name("insights");
+    stack
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a Linux GTK display; run alone with --ignored --test-threads=1"]
+    fn local_first_window_exposes_insights_and_mission_drafts_without_a_worker() {
+        assert_eq!(
+            std::env::consts::OS,
+            "linux",
+            "requires a Linux GTK display"
+        );
+        let context = gtk::glib::MainContext::default();
+        let _owner = context.acquire().unwrap();
+        adw::init().expect("GTK display unavailable");
+        let window = adw::ApplicationWindow::builder().build();
+        let stack = local_first_stack(&window);
+        assert!(stack.child_by_name("insights").is_some());
+        assert!(stack.child_by_name("mission-drafts").is_some());
+        stack.set_visible_child_name("mission-drafts");
+        assert_eq!(
+            stack.visible_child_name().as_deref(),
+            Some("mission-drafts")
+        );
+        window.close();
+    }
     #[test]
     fn episode_cleanup_notice_only_describes_reported_removed_groups() {
         use trace_commons_contributor::insights::MutationEffects;
         assert!(render_mutation_notice(&MutationEffects::default()).is_empty());
         let notice = render_mutation_notice(&MutationEffects {
             invalidated_episode_ids: vec!["group-a".into(), "group-b".into()],
+            ..MutationEffects::default()
         });
         assert!(notice.starts_with(copy("episode_invalidated_notice")));
         assert!(notice.ends_with("group-a\ngroup-b"));
@@ -1971,6 +2345,39 @@ mod tests {
             "Refresh failed"
         );
     }
+
+    #[test]
+    fn card_completions_bind_generation_and_exact_evidence_selection() {
+        let ticket = CardRequestTicket {
+            generation: 7,
+            snapshot_ids: vec!["snapshot-a".into()],
+            episode_ids: vec!["episode-a".into()],
+        };
+        assert!(accept_card_completion(
+            7,
+            &["snapshot-a".into()],
+            &["episode-a".into()],
+            &ticket
+        ));
+        assert!(!accept_card_completion(
+            8,
+            &["snapshot-a".into()],
+            &["episode-a".into()],
+            &ticket
+        ));
+        assert!(!accept_card_completion(
+            7,
+            &["snapshot-b".into()],
+            &["episode-a".into()],
+            &ticket
+        ));
+        assert!(!accept_card_completion(
+            7,
+            &["snapshot-a".into()],
+            &[],
+            &ticket
+        ));
+    }
     #[test]
     fn cancelled_read_cannot_publish_and_next_request_waits_for_completion() {
         let mut f = Flight::default();
@@ -2005,6 +2412,8 @@ mod tests {
             Coverage, EvidenceRef, InsightMetric, InsightReport, MetricId, ProviderManifest,
         };
         let insight = LocalInsight {
+            task_attribution: None,
+            claude_task_attribution: None,
             id: "fixture".into(),
             source_format: SourceFormat::Codex,
             boundary: trace_commons_contributor::insights::EpisodeBoundary::SessionProxy,
@@ -2043,6 +2452,7 @@ mod tests {
             model_observations: None,
             outcome_links: Vec::new(),
             time_evidence: None,
+            usage_evidence: None,
             analyzed_at: chrono::Utc::now(),
         };
         let text = render(&insight);
@@ -2171,7 +2581,8 @@ mod tests {
             "initial summary must not initialize storage"
         );
         assert!(view.summary.text().contains(copy("summary_empty")));
-        view.source.set_selected(1);
+        view.source
+            .set_selected(source_index(SourceFormat::Trajectory));
         *view.selected.borrow_mut() = Some(file.clone());
         view.analyze(false);
         settle();
@@ -2204,6 +2615,17 @@ mod tests {
                 .text()
                 .contains(copy("episode_no_overlap"))
         );
+        view.card_snapshot_choices.borrow()[0].1.set_active(true);
+        view.card_episode_choices.borrow()[0].1.set_active(true);
+        view.request_cards();
+        settle();
+        assert_eq!(view.card_state.get(), CardPanelState::Presented);
+        assert!(
+            view.card_result
+                .text()
+                .contains(question_copy(InsightQuestionId::RecordedActivity).1)
+        );
+        assert!(view.card_evidence.first_child().is_some());
         let second_file = temp.join("second.jsonl");
         std::fs::write(
             &second_file,

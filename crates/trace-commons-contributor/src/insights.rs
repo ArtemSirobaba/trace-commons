@@ -2,15 +2,29 @@
 //!
 //! No discovery, enrollment, network, or contribution path is invoked. A file
 //! is a provisional session boundary, never an inferred completed task.
+pub mod card_presentation;
+pub mod card_store;
+pub mod cards;
+pub mod claude_task_attribution;
+#[cfg(test)]
+pub(crate) mod comparison_estimator;
+pub(crate) mod comparison_exact;
+pub mod comparison_spec_store;
+pub mod comparison_specs;
+pub mod comparison_task_store;
+pub mod comparison_tasks;
 pub mod episode_store;
 pub mod episodes;
 pub mod models;
 pub mod outcomes;
+pub mod pricing_catalog;
 pub mod provider;
 pub mod service;
 pub mod summary;
+pub mod task_attribution;
 pub mod time_evidence;
 pub mod usage;
+pub mod usage_evidence;
 #[cfg(windows)]
 mod win_store_acl;
 
@@ -27,13 +41,20 @@ use trace_commons_protocol::insights::{
 };
 
 const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
-const STORE_VERSION: u32 = 6;
+// Advanced to 11 for model-observation schemas 2 and 3. A nested schema bump
+// without one here lets an older client accept the store and then reject
+// individual snapshots, with no diagnosable event and no downgrade path.
+// Advanced again to 12 for the per-address file identity an alias now records,
+// which is what lets a rename drop the superseded snapshot instead of keeping
+// it alive under a name the user no longer has.
+const STORE_VERSION: u32 = 12;
 const MAX_OUTCOME_LINKS: usize = 128;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceFormat {
     Codex,
+    ClaudeCode,
     Trajectory,
 }
 
@@ -45,6 +66,7 @@ impl SourceFormat {
     pub fn stable_id(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
+            Self::ClaudeCode => "ClaudeCode",
             Self::Trajectory => "Trajectory",
         }
     }
@@ -151,7 +173,8 @@ pub struct LocalInsight {
     pub source_format: SourceFormat,
     pub boundary: EpisodeBoundary,
     pub report: InsightReport,
-    /// Neither initial adapter preserves enough usage to estimate cost.
+    /// Deprecated compatibility field. Estimates require separately validated
+    /// usage attribution and versioned pricing; this field remains null.
     pub estimated_cost_usd: Option<f64>,
     pub cost_unavailable_reason: String,
     /// No semantic task classification is performed in this release.
@@ -169,6 +192,18 @@ pub struct LocalInsight {
     /// Legacy snapshots remain unknown until explicit reimport.
     #[serde(default)]
     pub time_evidence: Option<time_evidence::RecordedTimeEvidence>,
+    /// Native usage from the exact imported bytes. Legacy snapshots stay
+    /// unknown until reimport; trajectory has no supported native contract.
+    #[serde(default)]
+    pub usage_evidence: Option<usage_evidence::PersistedUsageEvidence>,
+    /// Source-bound structural task attribution. Legacy and non-Codex snapshots
+    /// remain unavailable until a qualified adapter produces this evidence.
+    #[serde(default)]
+    pub task_attribution: Option<task_attribution::CodexTaskAttributionEvidence>,
+    /// Observed Claude agent-branch structure. It does not establish a whole
+    /// task, human prompt, outcome, independence, or asynchronous completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_task_attribution: Option<claude_task_attribution::ClaudeTaskAttributionEvidence>,
     /// Import snapshot time; source freshness requires explicit reimport.
     pub analyzed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -241,6 +276,7 @@ pub fn analyze_file(format: SourceFormat, path: &Path) -> Result<LocalInsight> {
     let bytes = bounded_read(path)?;
     let source_digest = digest(&bytes);
     let events = match format {
+        SourceFormat::ClaudeCode => crate::source::claude_code::parse_selected_file_bytes(&bytes)?,
         SourceFormat::Trajectory => {
             crate::source::trajectory::parse_trajectory(&bytes)
                 .map_err(|_| anyhow!("insights_invalid_trajectory"))?
@@ -278,7 +314,31 @@ pub fn analyze_file(format: SourceFormat, path: &Path) -> Result<LocalInsight> {
         id: id.clone(),
         source_digest,
     };
-    let time_evidence = time_evidence::extract_recorded_time_evidence(format, &bytes)?;
+    let time_evidence = match format {
+        SourceFormat::ClaudeCode => None,
+        SourceFormat::Codex | SourceFormat::Trajectory => Some(
+            time_evidence::extract_recorded_time_evidence(format, &bytes)?,
+        ),
+    };
+    let usage_evidence = match format {
+        SourceFormat::Codex => Some(usage_evidence::extract_codex_usage_evidence(&bytes)?),
+        SourceFormat::ClaudeCode | SourceFormat::Trajectory => None,
+    };
+    let task_attribution = match format {
+        SourceFormat::Codex => Some(
+            task_attribution::classify_codex_task_attribution_for_import(
+                task_attribution::CodexTaskSourceProfile::CodexRustV0_154_0TaskRecords,
+                &bytes,
+            )?,
+        ),
+        SourceFormat::ClaudeCode | SourceFormat::Trajectory => None,
+    };
+    let claude_task_attribution = match format {
+        SourceFormat::ClaudeCode => Some(
+            claude_task_attribution::classify_claude_task_attribution(&bytes)?,
+        ),
+        SourceFormat::Codex | SourceFormat::Trajectory => None,
+    };
     let input = provider::ProviderInput::first_party(evidence, &events);
     let report = provider::dispatch(&provider::FirstPartyProvider, &input)?;
     Ok(LocalInsight {
@@ -290,9 +350,16 @@ pub fn analyze_file(format: SourceFormat, path: &Path) -> Result<LocalInsight> {
         cost_unavailable_reason: "adapter_usage_unavailable".into(),
         task_category: None,
         manual_annotation: None,
-        model_observations: Some(models::extract_model_observations(format, &bytes)?),
+        model_observations: match format {
+            SourceFormat::ClaudeCode | SourceFormat::Codex | SourceFormat::Trajectory => {
+                Some(models::extract_model_observations(format, &bytes)?)
+            }
+        },
         outcome_links: Vec::new(),
-        time_evidence: Some(time_evidence),
+        time_evidence,
+        usage_evidence,
+        task_attribution,
+        claude_task_attribution,
         analyzed_at: chrono::Utc::now(),
     })
 }
@@ -312,6 +379,9 @@ pub enum InsightsStoreError {
     Busy,
     /// The entry cannot be read. `repair` removes exactly what is unreadable.
     Invalid,
+    /// The store was written by a newer build. Nothing here can repair that,
+    /// and it is not the same event as an entry this build cannot read.
+    VersionUnsupported,
     /// A symlink stands where the store or its index must be.
     SymlinkRefused,
     /// The store directory is reachable by someone other than its owner.
@@ -327,6 +397,7 @@ impl std::fmt::Display for InsightsStoreError {
             Self::EvidenceLinkNotFound => "insights_evidence_link_not_found",
             Self::Busy => "insights_store_busy",
             Self::Invalid => "insights_store_invalid",
+            Self::VersionUnsupported => "insights_store_version_unsupported",
             Self::SymlinkRefused => "insights_store_symlink_refused",
             Self::PrivateDirectoryRequired => "insights_store_requires_private_directory",
             Self::Unavailable => "insights_store_unavailable",
@@ -339,6 +410,27 @@ impl std::error::Error for InsightsStoreError {}
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MutationEffects {
     pub invalidated_episode_ids: Vec<String>,
+    /// Retained tasks whose frozen episode/snapshot evidence is now stale.
+    pub stale_comparison_task_ids: Vec<String>,
+    /// Stable, content-free reasons for each affected retained task.
+    pub stale_comparison_tasks: Vec<StaleComparisonTaskEffect>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StaleComparisonTaskEffect {
+    pub task_id: String,
+    pub reasons: Vec<ComparisonTaskMutationReason>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonTaskMutationReason {
+    EpisodeMissing,
+    EpisodeRevisionChanged,
+    EpisodeMembershipChanged,
+    SnapshotMissingOrReplaced,
+    OverlapChanged,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -446,11 +538,18 @@ fn file_identity(_path: &Path) -> Option<String> {
 pub struct QuarantineReport {
     pub snapshot_ids: Vec<String>,
     pub episode_ids: Vec<String>,
+    #[serde(default)]
+    pub comparison_task_ids: Vec<String>,
+    #[serde(default)]
+    pub comparison_specification_ids: Vec<String>,
 }
 
 impl QuarantineReport {
     pub fn is_empty(&self) -> bool {
-        self.snapshot_ids.is_empty() && self.episode_ids.is_empty()
+        self.snapshot_ids.is_empty()
+            && self.episode_ids.is_empty()
+            && self.comparison_task_ids.is_empty()
+            && self.comparison_specification_ids.is_empty()
     }
 }
 
@@ -471,6 +570,8 @@ pub struct RepairReport {
 struct Quarantine {
     reports: BTreeMap<String, serde_json::Value>,
     episodes: BTreeMap<String, serde_json::Value>,
+    comparison_tasks: BTreeMap<String, serde_json::Value>,
+    comparison_specifications: BTreeMap<String, serde_json::Value>,
     dangling_aliases: usize,
 }
 
@@ -479,6 +580,8 @@ impl Quarantine {
         QuarantineReport {
             snapshot_ids: self.reports.keys().cloned().collect(),
             episode_ids: self.episodes.keys().cloned().collect(),
+            comparison_task_ids: self.comparison_tasks.keys().cloned().collect(),
+            comparison_specification_ids: self.comparison_specifications.keys().cloned().collect(),
         }
     }
 }
@@ -491,6 +594,10 @@ struct Index {
     reports: BTreeMap<String, LocalInsight>,
     #[serde(default)]
     episodes: BTreeMap<String, episodes::LocalEpisode>,
+    #[serde(default)]
+    comparison_tasks: BTreeMap<String, comparison_tasks::LocalComparisonTaskV1>,
+    #[serde(default)]
+    comparison_specifications: BTreeMap<String, comparison_specs::ComparisonSpecificationV1>,
     /// Populated at load, never persisted as its own field: the entries it
     /// holds are written back alongside the live ones.
     #[serde(skip)]
@@ -529,6 +636,9 @@ struct PersistedIndex<'a> {
     aliases: &'a BTreeMap<String, Alias>,
     reports: BTreeMap<&'a String, Stored<'a, LocalInsight>>,
     episodes: BTreeMap<&'a String, Stored<'a, episodes::LocalEpisode>>,
+    comparison_tasks: BTreeMap<&'a String, Stored<'a, comparison_tasks::LocalComparisonTaskV1>>,
+    comparison_specifications:
+        BTreeMap<&'a String, Stored<'a, comparison_specs::ComparisonSpecificationV1>>,
 }
 
 impl<'a> From<&'a Index> for PersistedIndex<'a> {
@@ -538,6 +648,11 @@ impl<'a> From<&'a Index> for PersistedIndex<'a> {
             aliases: &index.aliases,
             reports: stored(&index.reports, &index.quarantine.reports),
             episodes: stored(&index.episodes, &index.quarantine.episodes),
+            comparison_tasks: stored(&index.comparison_tasks, &index.quarantine.comparison_tasks),
+            comparison_specifications: stored(
+                &index.comparison_specifications,
+                &index.quarantine.comparison_specifications,
+            ),
         }
     }
 }
@@ -551,6 +666,10 @@ struct RawIndex {
     reports: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     episodes: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    comparison_tasks: BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    comparison_specifications: BTreeMap<String, serde_json::Value>,
 }
 
 impl Index {
@@ -660,22 +779,27 @@ impl LocalInsightStore {
                 aliases: BTreeMap::new(),
                 reports: BTreeMap::new(),
                 episodes: BTreeMap::new(),
+                comparison_tasks: BTreeMap::new(),
+                comparison_specifications: BTreeMap::new(),
             },
             Err(_) => bail!(InsightsStoreError::Unavailable),
         };
         if !(1..=STORE_VERSION).contains(&raw.version) {
-            bail!(InsightsStoreError::Invalid);
+            bail!(InsightsStoreError::VersionUnsupported);
         }
         // One unreadable entry must not take the store with it. Both the
-        // schema and the invariants are checked per entry: a failing snapshot
-        // or episode is moved aside, named, and withheld from every read,
-        // while the rest stay fully operable and `delete` and `repair` can
-        // still remove the one that failed.
+        // schema and the invariants are checked per entry: a failing snapshot,
+        // episode, comparison task, or comparison specification is moved
+        // aside, named, and withheld from every read, while the rest stay
+        // fully operable and `delete` and `repair` can still remove the one
+        // that failed.
         let mut index = Index {
             version: raw.version,
             aliases: raw.aliases,
             reports: BTreeMap::new(),
             episodes: BTreeMap::new(),
+            comparison_tasks: BTreeMap::new(),
+            comparison_specifications: BTreeMap::new(),
             quarantine: Quarantine::default(),
         };
         for (id, value) in raw.reports {
@@ -711,6 +835,28 @@ impl LocalInsightStore {
                 }
             }
         }
+        for (id, value) in raw.comparison_tasks {
+            match serde_json::from_value::<comparison_tasks::LocalComparisonTaskV1>(value.clone()) {
+                Ok(task) => {
+                    index.comparison_tasks.insert(id, task);
+                }
+                Err(_) => {
+                    index.quarantine.comparison_tasks.insert(id, value);
+                }
+            }
+        }
+        for (id, value) in raw.comparison_specifications {
+            match serde_json::from_value::<comparison_specs::ComparisonSpecificationV1>(
+                value.clone(),
+            ) {
+                Ok(specification) => {
+                    index.comparison_specifications.insert(id, specification);
+                }
+                Err(_) => {
+                    index.quarantine.comparison_specifications.insert(id, value);
+                }
+            }
+        }
         for id in episode_store::invalid_index_episodes(&index) {
             if let Some(episode) = index.episodes.remove(&id) {
                 index
@@ -719,7 +865,24 @@ impl LocalInsightStore {
                     .insert(id, serde_json::to_value(&episode)?);
             }
         }
-        // Legacy snapshots remain readable; the next mutation persists v6.
+        for id in comparison_task_store::invalid_index_comparison_tasks(&index) {
+            if let Some(task) = index.comparison_tasks.remove(&id) {
+                index
+                    .quarantine
+                    .comparison_tasks
+                    .insert(id, serde_json::to_value(&task)?);
+            }
+        }
+        for id in comparison_spec_store::invalid_index_comparison_specifications(&index) {
+            if let Some(specification) = index.comparison_specifications.remove(&id) {
+                index
+                    .quarantine
+                    .comparison_specifications
+                    .insert(id, serde_json::to_value(&specification)?);
+            }
+        }
+        comparison_spec_store::validate_index_comparison_qualification(&index)?;
+        // Legacy snapshots remain readable; the next mutation persists v12.
         index.version = STORE_VERSION;
         Ok((lock, index))
     }
@@ -756,6 +919,7 @@ impl LocalInsightStore {
             .map_err(|_| anyhow!("insights_source_unreadable"))?;
         let alias = digest(canonical.as_os_str().as_encoded_bytes());
         let (_lock, mut index) = self.locked()?;
+        let previous_report_ids = index.reports.keys().cloned().collect::<BTreeSet<_>>();
         // Content-identical copies share both evidence and annotation. A new
         // digest never inherits the old snapshot's user assessment.
         if let Some(previous) = index.reports.get(&insight.id) {
@@ -785,7 +949,13 @@ impl LocalInsightStore {
             .map(|alias| alias.report_id().to_owned())
             .collect::<BTreeSet<_>>();
         index.reports.retain(|id, _| referenced.contains(id));
-        let mutation_effects = episode_store::invalidate_missing_members(&mut index);
+        let current_report_ids = index.reports.keys().cloned().collect::<BTreeSet<_>>();
+        let affected_snapshot_ids = previous_report_ids
+            .symmetric_difference(&current_report_ids)
+            .cloned()
+            .collect();
+        let mutation_effects =
+            episode_store::invalidate_missing_members(&mut index, &affected_snapshot_ids);
         self.save(&index)?;
         Ok(SnapshotMutation {
             value: insight,
@@ -920,12 +1090,23 @@ impl LocalInsightStore {
         let (_lock, mut index) = self.locked()?;
         let quarantined = index.quarantine.report();
         let removed_aliases = index.quarantine.dangling_aliases;
+        // The snapshots repair is about to drop are exactly the inputs whose
+        // disappearance can leave a retained comparison task holding frozen
+        // evidence that no longer resolves.
+        let removed_snapshot_ids = index
+            .quarantine
+            .reports
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         index.quarantine.reports.clear();
         index.quarantine.episodes.clear();
+        index.quarantine.comparison_tasks.clear();
+        index.quarantine.comparison_specifications.clear();
         index
             .aliases
             .retain(|_, alias| index.reports.contains_key(alias.report_id()));
-        let effects = episode_store::invalidate_missing_members(&mut index);
+        let effects = episode_store::invalidate_missing_members(&mut index, &removed_snapshot_ids);
         self.save(&index)?;
         Ok(RepairReport {
             quarantined,
@@ -944,7 +1125,13 @@ impl LocalInsightStore {
         let (_lock, mut index) = self.locked()?;
         let removed =
             index.reports.remove(id).is_some() | index.quarantine.reports.remove(id).is_some();
-        let mutation_effects = episode_store::invalidate_missing_members(&mut index);
+        let affected_snapshot_ids = if removed {
+            BTreeSet::from([id.to_owned()])
+        } else {
+            BTreeSet::new()
+        };
+        let mutation_effects =
+            episode_store::invalidate_missing_members(&mut index, &affected_snapshot_ids);
         if removed {
             index.aliases.retain(|_, alias| alias.report_id() != id);
             self.save(&index)?;
@@ -990,6 +1177,42 @@ fn validate_stored_report(version: u32, id: &str, insight: &LocalInsight) -> Res
     }
     if version < 5 && insight.time_evidence.is_some() {
         bail!(InsightsStoreError::Invalid);
+    }
+    if version < 6 && insight.usage_evidence.is_some() {
+        bail!(InsightsStoreError::Invalid);
+    }
+    if version < 9 && insight.task_attribution.is_some() {
+        bail!(InsightsStoreError::Invalid);
+    }
+    if version < 10 && insight.claude_task_attribution.is_some() {
+        bail!(InsightsStoreError::Invalid);
+    }
+    if version < models::MODEL_OBSERVATIONS_STORE_VERSION_FLOOR
+        && insight
+            .model_observations
+            .as_ref()
+            .is_some_and(models::ModelObservations::requires_store_version_floor)
+    {
+        bail!(InsightsStoreError::Invalid);
+    }
+    if let Some(usage) = &insight.usage_evidence {
+        usage.validate_binding(insight.source_format, &reference.source_digest)?;
+    }
+    if let Some(attribution) = &insight.task_attribution {
+        attribution.validate()?;
+        if insight.source_format != SourceFormat::Codex
+            || attribution.source_digest != reference.source_digest
+        {
+            bail!(InsightsStoreError::Invalid);
+        }
+    }
+    if let Some(attribution) = &insight.claude_task_attribution {
+        attribution.validate()?;
+        if insight.source_format != SourceFormat::ClaudeCode
+            || attribution.source_digest != reference.source_digest
+        {
+            bail!(InsightsStoreError::Invalid);
+        }
     }
     if let Some(time_evidence) = &insight.time_evidence {
         time_evidence.validate()?;
@@ -1382,6 +1605,7 @@ mod tests {
         // are the digests over the live preimage, independent of this code.
         let source_digest = "a".repeat(64);
         assert_eq!(SourceFormat::Codex.stable_id(), "Codex");
+        assert_eq!(SourceFormat::ClaudeCode.stable_id(), "ClaudeCode");
         assert_eq!(SourceFormat::Trajectory.stable_id(), "Trajectory");
         assert_eq!(
             snapshot_identity(SourceFormat::Codex, &source_digest),
@@ -1618,6 +1842,82 @@ mod tests {
     }
 
     #[test]
+    fn claude_attribution_store_is_source_exclusive_and_requires_v10() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_path = dir.path().join("claude.jsonl");
+        fs::write(
+            &claude_path,
+            include_bytes!("../fixtures/insights/claude-task-attribution/agent-alpha.jsonl"),
+        )
+        .unwrap();
+        let codex_path = dir.path().join("codex.jsonl");
+        fs::write(
+            &codex_path,
+            include_bytes!("../fixtures/insights/codex-task-attribution/codex-release-0.154.0-alpha-direct.jsonl"),
+        )
+        .unwrap();
+        let store = LocalInsightStore::open(&dir.path().join("store")).unwrap();
+        let claude = store
+            .import(SourceFormat::ClaudeCode, &claude_path)
+            .unwrap();
+        let codex = store.import(SourceFormat::Codex, &codex_path).unwrap();
+        let path = store.dir.join("index.json");
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        let mut both = original.clone();
+        both["reports"][&claude.id]["task_attribution"] =
+            original["reports"][&codex.id]["task_attribution"].clone();
+        fs::write(&path, serde_json::to_vec(&both).unwrap()).unwrap();
+        assert_quarantined(
+            &store,
+            &claude.id,
+            "a Codex attribution on a Claude snapshot",
+        );
+
+        let mut legacy = original.clone();
+        legacy["version"] = 9.into();
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_quarantined(&store, &claude.id, "Claude attribution in a v9 store");
+
+        let mut wrong_source = original;
+        wrong_source["reports"][&claude.id]["source_format"] = "codex".into();
+        fs::write(&path, serde_json::to_vec(&wrong_source).unwrap()).unwrap();
+        assert_quarantined(&store, &claude.id, "a relabelled source format");
+        // Only the relabelled entry is withheld; the Codex snapshot still reads.
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.explain(&codex.id).unwrap().id, codex.id);
+    }
+
+    #[test]
+    fn shared_native_claude_snapshot_matches_the_rust_evidence_contract() {
+        const SHARED: &[u8] = include_bytes!(
+            "../fixtures/insights/claude-task-attribution/native-agent-alpha-snapshot.json"
+        );
+        let insight: LocalInsight = serde_json::from_slice(SHARED).unwrap();
+        // The native shells read this verdict instead of re-deriving it, so the
+        // shared fixture's stored value must be the one Rust recomputes.
+        let raw: serde_json::Value = serde_json::from_slice(SHARED).unwrap();
+        let observations = insight.model_observations.as_ref().unwrap();
+        assert_eq!(
+            raw["model_observations"]["contract"],
+            serde_json::to_value(observations.contract).unwrap()
+        );
+        assert_eq!(
+            observations.contract,
+            models::ModelCoverageContract::ClaudeAssistantMessageV3
+        );
+        assert_eq!(insight.source_format, SourceFormat::ClaudeCode);
+        assert!(insight.task_attribution.is_none());
+        let attribution = insight.claude_task_attribution.as_ref().unwrap();
+        attribution.validate().unwrap();
+        assert_eq!(
+            attribution.source_digest,
+            insight.report.evidence[0].source_digest
+        );
+    }
+
+    #[test]
     fn unknown_usage_and_outcomes_are_not_zero_or_tool_success() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fixture.jsonl");
@@ -1640,6 +1940,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fixture.jsonl");
         fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"fixture\"}]}}\n").unwrap();
+        let analyzed = analyze_file(SourceFormat::Codex, &path).unwrap();
+        assert!(matches!(
+            analyzed.task_attribution.unwrap().state,
+            task_attribution::TaskAttributionState::Unavailable {
+                reason: task_attribution::TaskAttributionUnavailableReason::SourceProfileMismatch,
+                ..
+            }
+        ));
+        fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{}}\n\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"fixture\"}]}}\n").unwrap();
         assert!(analyze_file(SourceFormat::Codex, &path).is_ok());
         fs::write(
             &path,
@@ -1648,6 +1957,88 @@ mod tests {
         .unwrap();
         assert!(analyze_file(SourceFormat::Codex, &path).is_err());
         assert!(analyze_file(SourceFormat::Trajectory, &path).is_err());
+    }
+
+    #[test]
+    fn claude_code_import_preserves_distinct_same_id_blocks_with_typed_unavailability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"user\",\"timestamp\":\"2026-09-12T12:00:00Z\",\"message\":{\"content\":\"synthetic request\"}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-09-12T12:00:01Z\",\"message\":{\"id\":\"msg_synthetic\",\"model\":\"fixture-model\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tool_synthetic\",\"name\":\"Read\",\"input\":{}}]}}\n",
+                "{\"type\":\"assistant\",\"timestamp\":\"2026-09-12T12:00:02Z\",\"message\":{\"id\":\"msg_synthetic\",\"model\":\"fixture-model\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tool_synthetic\",\"name\":\"Read\",\"input\":{}},{\"type\":\"text\",\"text\":\"synthetic answer\"}]}}\n",
+                "{\"type\":\"user\",\"timestamp\":\"2026-09-12T12:00:03Z\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool_synthetic\",\"content\":\"synthetic result\",\"is_error\":false}]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let analyzed = analyze_file(SourceFormat::ClaudeCode, &path).unwrap();
+        let metric = |id| {
+            analyzed
+                .report
+                .metrics
+                .iter()
+                .find(|metric| metric.id == id)
+                .unwrap()
+        };
+        assert_eq!(metric(MetricId::Events).value, Some(5));
+        assert_eq!(metric(MetricId::ToolCalls).value, Some(2));
+        assert_eq!(metric(MetricId::ToolFailures).value, Some(0));
+        assert_eq!(metric(MetricId::InputTokens).value, None);
+        assert_eq!(analyzed.source_format, SourceFormat::ClaudeCode);
+        let models = analyzed.model_observations.unwrap();
+        assert_eq!(models.schema_version, 3);
+        assert_eq!(models.candidate_records, 2);
+        assert_eq!(models.valid_declarations, 2);
+        assert_eq!(models.declared_models, ["fixture-model"]);
+        assert!(analyzed.usage_evidence.is_none());
+        assert!(analyzed.time_evidence.is_none());
+        assert!(analyzed.task_attribution.is_none());
+        assert!(matches!(
+            analyzed.claude_task_attribution.unwrap().state,
+            claude_task_attribution::ClaudeTaskAttributionState::Unavailable {
+                reason: claude_task_attribution::ClaudeTaskUnavailableReason::UnsupportedRecord,
+                ..
+            }
+        ));
+        assert_eq!(
+            analyzed.report.evidence[0].source_digest,
+            digest(&fs::read(path).unwrap())
+        );
+    }
+
+    #[test]
+    fn claude_code_import_deduplicates_only_exact_same_id_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.jsonl");
+        let record = "{\"type\":\"assistant\",\"message\":{\"id\":\"msg_synthetic\",\"content\":[{\"type\":\"text\",\"text\":\"synthetic answer\"}]}}\n";
+        fs::write(&path, format!("{record}{record}")).unwrap();
+        let analyzed = analyze_file(SourceFormat::ClaudeCode, &path).unwrap();
+        assert_eq!(
+            analyzed
+                .report
+                .metrics
+                .iter()
+                .find(|metric| metric.id == MetricId::Events)
+                .unwrap()
+                .value,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn claude_code_import_rejects_malformed_selected_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.jsonl");
+        fs::write(&path, "{\"type\":\"user\",\"message\":{}\n").unwrap();
+        assert_eq!(
+            analyze_file(SourceFormat::ClaudeCode, &path)
+                .unwrap_err()
+                .to_string(),
+            "insights_invalid_claude_code"
+        );
     }
 
     #[test]
@@ -1752,3 +2143,7 @@ mod tests {
 #[cfg(test)]
 #[path = "insights/evidence_tests.rs"]
 mod evidence_tests;
+
+#[cfg(test)]
+#[path = "insights/usage_store_tests.rs"]
+mod usage_store_tests;

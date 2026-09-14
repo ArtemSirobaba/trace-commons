@@ -10,11 +10,30 @@ final class InsightEvidenceBridgeTests: XCTestCase {
         let value = try JSONDecoder().decode(LocalInsight.self, from: Data(legacy.utf8))
         XCTAssertNil(value.model_observations)
         XCTAssertNil(value.outcome_links)
+        XCTAssertNil(value.claude_task_attribution)
         try value.validateSupportedEvidence()
+    }
+    func testClaudeAttributionIsAdditiveAndSourceSpecific() throws {
+        // Shared Rust-generated fixture: the attributed branch must contain real
+        // evidence, even though this decoder only consumes its display envelope.
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let fixture = repository.appendingPathComponent(
+            "crates/trace-commons-contributor/fixtures/insights/claude-task-attribution/native-agent-alpha-snapshot.json")
+        var snapshot = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: fixture)) as? [String: Any])
+        let current = try JSONDecoder().decode(LocalInsight.self, from: JSONSerialization.data(withJSONObject: snapshot))
+        XCTAssertEqual(current.claude_task_attribution?.state.status, "attributed")
+        try current.validateSupportedEvidence()
+        XCTAssertEqual(current.claude_task_attribution?.declared_model, "claude-opus-5")
+        XCTAssertEqual(current.claude_task_attribution?.record_count, 3)
+        snapshot["source_format"] = "codex"
+        let mismatched = try JSONDecoder().decode(LocalInsight.self, from: JSONSerialization.data(withJSONObject: snapshot))
+        XCTAssertThrowsError(try mismatched.validateSupportedEvidence())
     }
     func testMixedDeclarationsAndMissingnessRemainTyped() throws {
         let json = """
-        {"schema_version":1,"scope":"declared_metadata_only","source_format":"codex","source_digest":"abc","coordinates":"jsonl_physical_lines_one_based","record_count":8,"candidate_records":5,"valid_declarations":2,"missing_declarations":2,"invalid_declarations":1,"omitted_declarations":0,"model_labels_omitted":false,"mixed_declared_models":true,"declared_models":["fixture-a","fixture-b"],"declarations":[{"model":"fixture-a","record_index":1,"kind":"codex_session_metadata"},{"model":"fixture-b","record_index":8,"kind":"codex_turn_context"}]}
+        {"schema_version":1,"scope":"declared_metadata_only","source_format":"codex","source_digest":"abc","coordinates":"jsonl_physical_lines_one_based","record_count":8,"candidate_records":5,"valid_declarations":2,"missing_declarations":2,"invalid_declarations":1,"omitted_declarations":0,"model_labels_omitted":false,"mixed_declared_models":true,"declared_models":["fixture-a","fixture-b"],"declarations":[{"model":"fixture-a","record_index":1,"kind":"codex_session_metadata"},{"model":"fixture-b","record_index":8,"kind":"codex_turn_context"}],"contract":"legacy_declared_metadata_v1"}
         """
         let value = try JSONDecoder().decode(InsightModelObservations.self, from: Data(json.utf8))
         XCTAssertTrue(value.mixed_declared_models)
@@ -24,12 +43,32 @@ final class InsightEvidenceBridgeTests: XCTestCase {
         XCTAssertEqual(value.invalid_declarations, 1)
         XCTAssertThrowsError(try JSONDecoder().decode(InsightModelObservations.self,
             from: Data(json.replacingOccurrences(of: "declared_metadata_only", with: "verified_identity").utf8)))
+    }
+
+    /// Rust is the single validator of the coverage contract. This shell renders
+    /// the verdicts it knows, refuses the one Rust rejected, and fails to decode
+    /// a verdict from a newer build rather than guessing what it means. It
+    /// deliberately no longer re-derives counters, ordering, kinds or labels.
+    func testTheShellConsumesRustsCoverageVerdictInsteadOfRederivingIt() throws {
+        let body = """
+        {"schema_version":2,"scope":"declared_metadata_only","source_format":"codex","source_digest":"abc","coordinates":"jsonl_physical_lines_one_based","record_count":2,"candidate_records":0,"valid_declarations":0,"missing_declarations":0,"invalid_declarations":0,"omitted_declarations":0,"model_labels_omitted":false,"mixed_declared_models":false,"declared_models":[],"declarations":[],"contract":"CONTRACT"}
+        """
         var snapshot = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(legacy.utf8)) as? [String: Any])
-        var observations = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
-        observations["schema_version"] = 2
-        snapshot["model_observations"] = observations
-        let unsupported = try JSONDecoder().decode(LocalInsight.self, from: JSONSerialization.data(withJSONObject: snapshot))
-        XCTAssertThrowsError(try unsupported.validateSupportedEvidence())
+        for accepted in ["legacy_declared_metadata_v1", "codex_turn_context_v2", "claude_assistant_message_v3"] {
+            let text = body.replacingOccurrences(of: "CONTRACT", with: accepted)
+            snapshot["model_observations"] = try JSONSerialization.jsonObject(with: Data(text.utf8))
+            let value = try JSONDecoder().decode(LocalInsight.self, from: JSONSerialization.data(withJSONObject: snapshot))
+            try value.validateSupportedEvidence()
+        }
+        let refused = body.replacingOccurrences(of: "CONTRACT", with: "unsupported")
+        snapshot["model_observations"] = try JSONSerialization.jsonObject(with: Data(refused.utf8))
+        let rejected = try JSONDecoder().decode(LocalInsight.self, from: JSONSerialization.data(withJSONObject: snapshot))
+        XCTAssertThrowsError(try rejected.validateSupportedEvidence())
+
+        let newer = body.replacingOccurrences(of: "CONTRACT", with: "codex_turn_context_v4")
+        snapshot["model_observations"] = try JSONSerialization.jsonObject(with: Data(newer.utf8))
+        XCTAssertThrowsError(try JSONDecoder().decode(
+            LocalInsight.self, from: JSONSerialization.data(withJSONObject: snapshot)))
     }
     func testLinkRequestPreservesExplicitInputsAndSnapshotID() throws {
         let request = InsightsRequest(operation: .init("link_git", id: "snapshot", repository: "/selected/repo", commit: String(repeating: "a", count: 40)))

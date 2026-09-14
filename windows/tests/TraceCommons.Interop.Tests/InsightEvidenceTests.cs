@@ -24,7 +24,8 @@ public sealed class InsightEvidenceTests
            "missing_declarations":1,"invalid_declarations":1,"omitted_declarations":1,"model_labels_omitted":false,
            "mixed_declared_models":true,"declared_models":["model-a","model-b"],"declarations":[
              {"model":"model-a","record_index":1,"kind":"codex_session_metadata"},
-             {"model":"model-b","record_index":2,"kind":"codex_turn_context"}]}
+             {"model":"model-b","record_index":2,"kind":"codex_turn_context"}],
+           "contract":"legacy_declared_metadata_v1"}
           """);
         snapshot["outcome_links"] = JsonNode.Parse("""
           [{"id":"git-link","source_digest":"source-digest","linked_at":"2026-09-11T10:00:00Z","provenance":"user_linked",
@@ -83,6 +84,7 @@ public sealed class InsightEvidenceTests
     {
         var legacy = InsightEvidence.Decode(Json(InsightsTests.Insight));
         Assert.Null(legacy.ModelObservations);
+        Assert.Null(legacy.ClaudeTaskAttribution);
         Assert.Empty(legacy.OutcomeLinks);
         var current = InsightEvidence.Decode(Json(Fixture()));
         Assert.True(current.ModelObservations!.MixedDeclaredModels);
@@ -93,6 +95,46 @@ public sealed class InsightEvidenceTests
         Assert.Equal(0UL, report.Failed);
         Assert.Null(report.CommitId);
         Assert.Equal("imported_report", report.Provenance);
+        Assert.True(current.ModelObservations.IsSupported());
+        var refused = InsightEvidence.Decode(Json(Fixture().Replace(
+            "\"contract\":\"legacy_declared_metadata_v1\"", "\"contract\":\"unsupported\"", StringComparison.Ordinal)));
+        Assert.False(refused.ModelObservations!.IsSupported());
+    }
+    [Fact]
+    public void ClaudeAttributionIsAdditiveAndSourceSpecific()
+    {
+        var snapshot = JsonNode.Parse(InsightsTests.Insight)!;
+        snapshot["source_format"] = "claude_code";
+        snapshot["claude_task_attribution"] = JsonNode.Parse("""
+          {"schema_version":1,"extractor_version":1,"profile_id":"claude-code-v2.1.260-observed-agent-branch-v1",
+           "observed_writer_version":"2.1.260","qualification_scope":"observed_writer_agent_branch_records",
+           "source_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+           "record_count":3,"recognized_records":3,"state":{"status":"attributed","branch":{}}}
+          """);
+        var current = InsightEvidence.Decode(Json(snapshot.ToJsonString()));
+        Assert.True(current.ClaudeTaskAttribution!.IsSupported("claude_code"));
+        Assert.False(current.ClaudeTaskAttribution.IsSupported("codex"));
+    }
+    /// <summary>Rust is the single validator of the coverage contract. This shell
+    /// renders the verdicts it knows and refuses every other, including one from a
+    /// newer build; it deliberately no longer re-derives the invariant itself.</summary>
+    [Theory]
+    [InlineData("legacy_declared_metadata_v1", true)]
+    [InlineData("codex_turn_context_v2", true)]
+    [InlineData("claude_assistant_message_v3", true)]
+    [InlineData("unsupported", false)]
+    [InlineData("codex_turn_context_v4", false)]
+    public void OnlyContractVerdictsThisShellRendersAreSupported(string contract, bool supported)
+    {
+        string json = """
+          {"schema_version":2,"scope":"declared_metadata_only","source_format":"codex","source_digest":"source-digest",
+           "coordinates":"jsonl_physical_lines_one_based","record_count":2,"candidate_records":0,"valid_declarations":0,
+           "missing_declarations":0,"invalid_declarations":0,"omitted_declarations":0,"model_labels_omitted":false,
+           "mixed_declared_models":false,"declared_models":[],"declarations":[],"contract":"PLACEHOLDER"}
+          """.Replace("PLACEHOLDER", contract, StringComparison.Ordinal);
+        var observations = JsonSerializer.Deserialize<DeclaredModelObservations>(json,
+            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower })!;
+        Assert.Equal(supported, observations.IsSupported());
     }
     [Fact]
     public async Task RenderKeepsDeclarationsAndImportedReportsSeparateFromVerifiedOutcomes()
@@ -131,6 +173,25 @@ public sealed class InsightEvidenceTests
         await model.ExplainAsync("snapshot-a");
         Assert.Equal("Unavailable until reimport", model.ModelDetails);
         Assert.Empty(model.OutcomeEvidence);
+    }
+    [Fact]
+    public async Task RenderAcceptsSchemaTwoKnownAbsenceWithoutInventingAModel()
+    {
+        var snapshot = JsonNode.Parse(InsightsTests.Insight)!;
+        snapshot["model_observations"] = JsonNode.Parse("""
+          {"schema_version":2,"scope":"declared_metadata_only","source_format":"codex","source_digest":"source-digest",
+           "coordinates":"jsonl_physical_lines_one_based","record_count":2,"candidate_records":0,"valid_declarations":0,
+           "missing_declarations":0,"invalid_declarations":0,"omitted_declarations":0,"model_labels_omitted":false,
+           "mixed_declared_models":false,"declared_models":[],"declarations":[],
+           "contract":"codex_turn_context_v2"}
+          """);
+        var service = new Service { Snapshot = snapshot.ToJsonString() };
+        using var model = new InsightsViewModel(service);
+        await model.LoadAsync();
+        await model.ExplainAsync("snapshot-a");
+        Assert.Contains("model_no_labels", model.ModelDetails);
+        Assert.Contains("model_candidates: 0", model.ModelDetails);
+        Assert.Empty(model.ModelReferences);
     }
     [Fact]
     public async Task PickerTicketIsBoundToSelectionReentryAndClosedLifetime()
@@ -243,8 +304,11 @@ public sealed class InsightEvidenceTests
             Assert.False(Directory.Exists(store));
             await model.AnalyzeAsync("codex", file, true);
             Assert.NotNull(model.CurrentId);
-            Assert.Contains("model-a, model-b", model.ModelDetails);
-            Assert.Equal(2, model.ModelReferences.Count);
+            Assert.Contains("model-b", model.ModelDetails);
+            Assert.DoesNotContain("model-a", model.ModelDetails);
+            Assert.Single(model.ModelReferences);
+            await model.AnalyzeAsync("codex", file, true);
+            Assert.Single(model.Saved);
             string reportFile = Path.Combine(root, "report.json");
             await File.WriteAllTextAsync(reportFile, JsonSerializer.Serialize(new {
                 schema_version = 1, runner = "synthetic-test", passed = 1, failed = 0, skipped = 0,
@@ -267,6 +331,14 @@ public sealed class InsightEvidenceTests
             Assert.Equal("Inspected local Git object", Assert.Single(model.OutcomeEvidence).Label);
             Assert.True(File.Exists(reportFile));
             Assert.True(File.Exists(file));
+            string absent = Path.Combine(root, "absent.jsonl");
+            await File.WriteAllTextAsync(absent, "{\"type\":\"session_meta\",\"payload\":{\"model\":\"ignored\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"model\":\"ignored\",\"content\":[]}}\n");
+            await model.AnalyzeAsync("codex", absent, true);
+            Assert.Contains("No valid model names were retained.", model.ModelDetails);
+            Assert.Contains("Supported metadata records: 0", model.ModelDetails);
+            Assert.DoesNotContain("ignored", model.ModelDetails);
+            Assert.Empty(model.ModelReferences);
+            Assert.Equal(2, model.Saved.Count);
             Assert.False(File.Exists(Path.Combine(root, "contributor.json")));
         }
         finally { DeleteTestTree(root); }

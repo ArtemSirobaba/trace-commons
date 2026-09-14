@@ -1,7 +1,16 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Subcommand, ValueEnum};
+use trace_commons_contributor::insights::comparison_specs::{
+    ComparisonSpecificationDraftInput, ComparisonSpecificationV1, DescriptiveComparisonResultV1,
+    ExactCandidateDecision, ExactCandidateEvaluation, ExactComparisonStratumV1,
+};
+use trace_commons_contributor::insights::comparison_tasks::{
+    CheckoutProvenance, ComparisonConfigurationV1, ComparisonTaskContextInput, ContextDigest,
+    ContextString,
+};
 use trace_commons_contributor::insights::service::{
     LocalInsightsOperation, LocalInsightsRequest, LocalInsightsResponse, execute,
 };
@@ -11,6 +20,7 @@ use trace_commons_contributor::insights::{
     TaskOutcome, service::open_store,
 };
 use trace_commons_protocol::insights::MetricId;
+use trace_commons_protocol::insights_cards::InsightQuestionId;
 
 #[derive(Args)]
 pub(super) struct InsightsArgs {
@@ -23,6 +33,13 @@ pub(super) struct InsightsArgs {
 
 #[derive(Subcommand)]
 enum InsightsCommand {
+    /// Show shared cards for explicitly selected snapshots and episode groups
+    Cards {
+        #[arg(long = "snapshot")]
+        snapshot_ids: Vec<String>,
+        #[arg(long = "episode")]
+        episode_ids: Vec<String>,
+    },
     /// Group explicitly selected whole saved snapshots; not inferred task boundaries
     EpisodeCreate {
         #[arg(long = "snapshot", required = true)]
@@ -61,6 +78,16 @@ enum InsightsCommand {
         id: String,
         #[arg(long)]
         expected_revision: u64,
+    },
+    /// Manage user-reviewed comparison tasks built from frozen episodes
+    ComparisonTask {
+        #[command(subcommand)]
+        command: ComparisonTaskCommand,
+    },
+    /// Save and evaluate retrospective comparisons of reviewed tasks
+    Comparison {
+        #[command(subcommand)]
+        command: ComparisonCommand,
     },
     /// Analyze one selected file locally; persist only when --save is supplied
     Analyze {
@@ -117,6 +144,108 @@ enum InsightsCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ComparisonTaskCommand {
+    Create {
+        #[arg(long = "episode", required = true)]
+        episode_ids: Vec<String>,
+    },
+    List,
+    Explain {
+        id: String,
+    },
+    ReplaceEpisodes {
+        id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long = "episode", required = true)]
+        episode_ids: Vec<String>,
+    },
+    SetContext {
+        id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        task_date: String,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        harness_id: Option<String>,
+        #[arg(long)]
+        harness_version: Option<String>,
+        #[arg(long, default_value = "unknown", value_parser = ["unknown", "none", "minimal", "low", "medium", "high", "xhigh"])]
+        reasoning_effort: String,
+        #[arg(long)]
+        tool_policy_id: Option<String>,
+        #[arg(long)]
+        tool_policy_version: Option<String>,
+        #[arg(long)]
+        prompt_template_digest: Option<String>,
+    },
+    SetOutcome {
+        id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long, value_parser = ["pending", "accepted", "partial", "rejected", "unknown"])]
+        outcome: String,
+    },
+    ClearOutcome {
+        id: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+    Reconfirm {
+        id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        material_digest: String,
+    },
+    Delete {
+        id: String,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ComparisonCommand {
+    PreviewSpec(ComparisonSpecArgs),
+    SaveSpec(ComparisonSpecArgs),
+    ListSpecs,
+    GetSpec {
+        id: String,
+    },
+    Evaluate {
+        id: String,
+    },
+    ExplainResult {
+        specification_id: String,
+        #[arg(long)]
+        audit_digest: String,
+    },
+}
+
+#[derive(Args)]
+struct ComparisonSpecArgs {
+    #[arg(long)]
+    evidence_cutoff: String,
+    #[arg(long = "cohort", required = true, num_args = 2)]
+    cohort_labels: Vec<String>,
+    #[arg(long)]
+    date_start: String,
+    #[arg(long)]
+    date_end: String,
+    #[arg(long)]
+    project_id: String,
+    #[arg(long)]
+    language: String,
+    #[arg(long)]
+    configuration_fingerprint: String,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum NativeUsageSource {
     Codex,
@@ -126,6 +255,7 @@ enum NativeUsageSource {
 #[derive(Clone, Copy, ValueEnum)]
 enum Source {
     Codex,
+    ClaudeCode,
     Trajectory,
 }
 
@@ -133,6 +263,7 @@ impl From<Source> for SourceFormat {
     fn from(value: Source) -> Self {
         match value {
             Source::Codex => Self::Codex,
+            Source::ClaudeCode => Self::ClaudeCode,
             Source::Trajectory => Self::Trajectory,
         }
     }
@@ -144,6 +275,25 @@ fn store(args: &InsightsArgs) -> Result<LocalInsightStore> {
 
 pub(super) fn run(args: &InsightsArgs, json: bool) -> Result<()> {
     match &args.command {
+        InsightsCommand::Cards {
+            snapshot_ids,
+            episode_ids,
+        } => {
+            let response = execute(LocalInsightsRequest {
+                store_dir: args.store_dir.clone(),
+                operation: LocalInsightsOperation::QuestionCards {
+                    questions: InsightQuestionId::ALL.to_vec(),
+                    snapshot_ids: snapshot_ids.clone(),
+                    episode_ids: episode_ids.clone(),
+                },
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else if let LocalInsightsResponse::QuestionCards { text, .. } = response {
+                println!("{text}");
+            }
+        }
+
         InsightsCommand::EpisodeCreate { snapshot_ids } => render_episode_operation(
             args,
             LocalInsightsOperation::EpisodeCreate {
@@ -209,6 +359,128 @@ pub(super) fn run(args: &InsightsArgs, json: bool) -> Result<()> {
             },
             json,
         )?,
+        InsightsCommand::ComparisonTask { command } => {
+            let operation = match command {
+                ComparisonTaskCommand::Create { episode_ids } => {
+                    LocalInsightsOperation::ComparisonTaskCreate {
+                        episode_ids: episode_ids.clone(),
+                    }
+                }
+                ComparisonTaskCommand::List => LocalInsightsOperation::ComparisonTaskList {},
+                ComparisonTaskCommand::Explain { id } => {
+                    LocalInsightsOperation::ComparisonTaskExplain { id: id.clone() }
+                }
+                ComparisonTaskCommand::ReplaceEpisodes {
+                    id,
+                    expected_revision,
+                    episode_ids,
+                } => LocalInsightsOperation::ComparisonTaskReplaceEpisodes {
+                    id: id.clone(),
+                    expected_revision: *expected_revision,
+                    episode_ids: episode_ids.clone(),
+                },
+                ComparisonTaskCommand::SetContext {
+                    id,
+                    expected_revision,
+                    project_id,
+                    task_date,
+                    language,
+                    harness_id,
+                    harness_version,
+                    reasoning_effort,
+                    tool_policy_id,
+                    tool_policy_version,
+                    prompt_template_digest,
+                } => {
+                    let configuration = ComparisonConfigurationV1 {
+                        harness_id: context_string(harness_id),
+                        harness_version: context_string(harness_version),
+                        reasoning_effort: serde_json::from_value(reasoning_effort.clone().into())?,
+                        tool_policy_id: context_string(tool_policy_id),
+                        tool_policy_version: context_string(tool_policy_version),
+                        prompt_template_digest: prompt_template_digest.as_ref().map_or(
+                            ContextDigest::Unknown,
+                            |digest| ContextDigest::Known {
+                                digest: digest.clone(),
+                            },
+                        ),
+                    };
+                    let context = ComparisonTaskContextInput {
+                        project_id: project_id.clone(),
+                        category: TaskCategory::Refactor,
+                        task_date: task_date.parse()?,
+                        checkout_provenance: CheckoutProvenance::Unavailable,
+                        language: context_string(language),
+                        configuration,
+                    };
+                    LocalInsightsOperation::ComparisonTaskSetContext {
+                        id: id.clone(),
+                        expected_revision: *expected_revision,
+                        context,
+                    }
+                }
+                ComparisonTaskCommand::SetOutcome {
+                    id,
+                    expected_revision,
+                    outcome,
+                } => LocalInsightsOperation::ComparisonTaskSetOutcome {
+                    id: id.clone(),
+                    expected_revision: *expected_revision,
+                    outcome: serde_json::from_value(outcome.clone().into())?,
+                },
+                ComparisonTaskCommand::ClearOutcome {
+                    id,
+                    expected_revision,
+                } => LocalInsightsOperation::ComparisonTaskClearOutcome {
+                    id: id.clone(),
+                    expected_revision: *expected_revision,
+                },
+                ComparisonTaskCommand::Reconfirm {
+                    id,
+                    expected_revision,
+                    material_digest,
+                } => LocalInsightsOperation::ComparisonTaskReconfirm {
+                    id: id.clone(),
+                    expected_revision: *expected_revision,
+                    displayed_material_digest: material_digest.clone(),
+                },
+                ComparisonTaskCommand::Delete {
+                    id,
+                    expected_revision,
+                } => LocalInsightsOperation::ComparisonTaskDelete {
+                    id: id.clone(),
+                    expected_revision: *expected_revision,
+                },
+            };
+            render_comparison_task_operation(args, operation, json)?;
+        }
+        InsightsCommand::Comparison { command } => {
+            let operation = match command {
+                ComparisonCommand::PreviewSpec(input) => {
+                    LocalInsightsOperation::ComparisonPreviewSpec {
+                        input: comparison_spec_input(input)?,
+                    }
+                }
+                ComparisonCommand::SaveSpec(input) => LocalInsightsOperation::ComparisonSaveSpec {
+                    input: comparison_spec_input(input)?,
+                },
+                ComparisonCommand::ListSpecs => LocalInsightsOperation::ComparisonListSpecs {},
+                ComparisonCommand::GetSpec { id } => {
+                    LocalInsightsOperation::ComparisonGetSpec { id: id.clone() }
+                }
+                ComparisonCommand::Evaluate { id } => {
+                    LocalInsightsOperation::ComparisonEvaluate { id: id.clone() }
+                }
+                ComparisonCommand::ExplainResult {
+                    specification_id,
+                    audit_digest,
+                } => LocalInsightsOperation::ComparisonExplainResult {
+                    specification_id: specification_id.clone(),
+                    audit_digest: audit_digest.clone(),
+                },
+            };
+            render_comparison_operation(args, operation, json)?;
+        }
         InsightsCommand::Analyze { source, file, save } => {
             let LocalInsightsResponse::Analyze {
                 insight,
@@ -289,6 +561,12 @@ pub(super) fn run(args: &InsightsArgs, json: bool) -> Result<()> {
                 }
                 for id in &repaired.quarantined.episode_ids {
                     println!("  removed episode {id}");
+                }
+                for id in &repaired.quarantined.comparison_task_ids {
+                    println!("  removed comparison task {id}");
+                }
+                for id in &repaired.quarantined.comparison_specification_ids {
+                    println!("  removed comparison specification {id}");
                 }
                 for id in &repaired.invalidated_episode_ids {
                     println!("  removed episode {id} because a member snapshot went with it");
@@ -425,6 +703,376 @@ pub(super) fn run(args: &InsightsArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn context_string(value: &Option<String>) -> ContextString {
+    value
+        .as_ref()
+        .map_or(ContextString::Unknown, |value| ContextString::Known {
+            value: value.clone(),
+        })
+}
+
+fn comparison_spec_input(input: &ComparisonSpecArgs) -> Result<ComparisonSpecificationDraftInput> {
+    let mut cohort_labels = input.cohort_labels.clone();
+    cohort_labels.sort();
+    Ok(ComparisonSpecificationDraftInput {
+        evidence_cutoff: input.evidence_cutoff.parse()?,
+        cohort_labels,
+        date_start: input.date_start.parse()?,
+        date_end: input.date_end.parse()?,
+        stratum: ExactComparisonStratumV1 {
+            project_id: input.project_id.clone(),
+            language: input.language.clone(),
+            configuration_fingerprint: input.configuration_fingerprint.clone(),
+        },
+    })
+}
+
+fn render_comparison_operation(
+    args: &InsightsArgs,
+    operation: LocalInsightsOperation,
+    json: bool,
+) -> Result<()> {
+    let response = execute(LocalInsightsRequest {
+        store_dir: args.store_dir.clone(),
+        operation,
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+    let copy = trace_commons_contributor::insights::service::ui_copy();
+    match response {
+        LocalInsightsResponse::ComparisonPreviewSpec {
+            specification,
+            result,
+        } => {
+            println!("{}", copy["comparison_preview_notice"]);
+            render_comparison_specification(&specification, &copy);
+            render_comparison_result(&result, &copy)?;
+        }
+        LocalInsightsResponse::ComparisonSpecification { specification } => {
+            render_comparison_specification(&specification, &copy);
+        }
+        LocalInsightsResponse::ComparisonSpecificationList { specifications } => {
+            if specifications.is_empty() {
+                println!("{}", copy["comparison_specifications_empty"]);
+            }
+            for specification in specifications {
+                render_comparison_specification(&specification, &copy);
+            }
+        }
+        LocalInsightsResponse::ComparisonResult { result } => {
+            render_comparison_result(&result, &copy)?;
+        }
+        _ => anyhow::bail!("insights-comparison-response-invalid"),
+    }
+    Ok(())
+}
+
+fn render_comparison_specification(
+    specification: &ComparisonSpecificationV1,
+    copy: &std::collections::BTreeMap<String, String>,
+) {
+    println!(
+        "{}: {}",
+        copy["comparison_specification_title"], specification.id
+    );
+    println!("{}", copy["comparison_retrospective_notice"]);
+    println!(
+        "Cohorts: {} {}",
+        specification.cohort_labels.join(" / "),
+        copy["comparison_cohort_declared_not_verified"]
+    );
+    println!(
+        "Project: {} · Language: {}",
+        specification.stratum.project_id, specification.stratum.language
+    );
+    println!(
+        "Task dates: {} through {}",
+        specification.date_start, specification.date_end
+    );
+    println!("Evidence cutoff: {}", specification.evidence_cutoff);
+    println!(
+        "Configuration: {}",
+        specification.stratum.configuration_fingerprint
+    );
+}
+
+fn render_comparison_result(
+    result: &DescriptiveComparisonResultV1,
+    copy: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    println!(
+        "{}: {}",
+        copy["comparison_specification_title"], result.specification_id
+    );
+    println!("{}", copy["comparison_retrospective_notice"]);
+    if result.schema_version == 1 {
+        println!("{}", copy["comparison_descriptive_notice"]);
+    } else {
+        println!("{}", copy["comparison_exact_notice"]);
+    }
+    if result.included_task_ids.is_empty() {
+        println!("{}", copy["comparison_no_eligible_evidence"]);
+    }
+    println!("{}", copy["comparison_cohort_declaration_notice"]);
+    for cohort in &result.cohorts {
+        let outcomes = &cohort.outcomes;
+        println!(
+            "{} {}: {} included tasks; {} assessed",
+            cohort.cohort_label,
+            copy["comparison_cohort_declared_not_verified"],
+            cohort.included_tasks,
+            outcomes.assessed
+        );
+        println!(
+            "  Accepted: {} · Partial: {} · Rejected: {}",
+            outcomes.accepted, outcomes.partial, outcomes.rejected
+        );
+        println!(
+            "  Pending: {} · Unknown: {} · Unassessed: {}",
+            outcomes.pending, outcomes.unknown, outcomes.unassessed
+        );
+        println!(
+            "  Observed attributed tokens: {} across {} tasks; unavailable for {} tasks",
+            cohort.usage.observed_attributed_tokens,
+            cohort.usage.tasks_with_observed_attributed_tokens,
+            cohort.usage.tasks_without_observed_attributed_tokens
+        );
+    }
+    println!("{}", copy["comparison_denominator_notice"]);
+    if let Some(estimation) = &result.exact_estimation {
+        print!("{}", exact_estimation_text(result, estimation, copy)?);
+    }
+    for task_id in &result.included_task_ids {
+        println!("Included task: {task_id}");
+    }
+    for task in &result.excluded_tasks {
+        let reasons = task
+            .reasons
+            .iter()
+            .map(|reason| {
+                let value = serde_json::to_value(reason)?;
+                let key = format!(
+                    "comparison_exclusion_{}",
+                    value.as_str().unwrap_or("unknown")
+                );
+                copy.get(&key)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("insights-comparison-copy-missing"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        println!("Excluded task {}: {}", task.task_id, reasons.join("; "));
+    }
+    println!("Audit digest: {}", result.audit_digest);
+    Ok(())
+}
+
+fn exact_estimation_text(
+    result: &DescriptiveComparisonResultV1,
+    estimation: &trace_commons_contributor::insights::comparison_specs::QualifiedExactEstimationV1,
+    copy: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    let mut rendered = String::new();
+    let [first_label, second_label] = &estimation.cohort_labels;
+    writeln!(
+        rendered,
+        "{second_label} {} {first_label}",
+        copy["comparison_exact_minus"]
+    )?;
+    writeln!(rendered, "{}", copy["comparison_exact_orientation"])?;
+    for ((label, counts), cohort) in estimation
+        .cohort_labels
+        .iter()
+        .zip(&estimation.assessed_counts)
+        .zip(&result.cohorts)
+    {
+        writeln!(
+            rendered,
+            "{label}: {}: {} / {}: {}",
+            copy["comparison_specification_assessed"],
+            counts.total,
+            copy["comparison_specification_included"],
+            cohort.included_tasks
+        )?;
+    }
+    match &estimation.evaluation {
+        ExactCandidateEvaluation::SuppressedBelowMinimumCohortSupport => {
+            writeln!(rendered, "{}", copy["comparison_exact_support_unavailable"])?;
+        }
+        ExactCandidateEvaluation::Supported { contrasts, .. } => {
+            let names = ["Accepted", "Partial", "Rejected"];
+            for (index, (name, contrast)) in names.iter().zip(contrasts).enumerate() {
+                let first = &estimation.assessed_counts[0];
+                let second = &estimation.assessed_counts[1];
+                let first_count = [first.accepted, first.partial, first.rejected][index];
+                let second_count = [second.accepted, second.partial, second.rejected][index];
+                writeln!(
+                    rendered,
+                    "{name}: {first_count}/{} ({:.2}%) {} {second_count}/{} ({:.2}%)",
+                    first.total,
+                    percent(first_count, first.total),
+                    copy["comparison_exact_versus"],
+                    second.total,
+                    percent(second_count, second.total)
+                )?;
+                let observed =
+                    percent(second_count, second.total) - percent(first_count, first.total);
+                writeln!(
+                    rendered,
+                    "  {}: {observed:+.4} {}",
+                    copy["comparison_exact_observed_difference"],
+                    copy["comparison_exact_percentage_points"]
+                )?;
+                writeln!(
+                    rendered,
+                    "  {}: [{:+.4}, {:+.4}] {}",
+                    copy["comparison_exact_interval"],
+                    contrast.lower_millionths as f64 / 10_000.0,
+                    contrast.upper_millionths as f64 / 10_000.0,
+                    copy["comparison_exact_percentage_points"]
+                )?;
+                let key = match contrast.decision {
+                    ExactCandidateDecision::InsufficientPrecision => {
+                        "comparison_exact_insufficient_precision"
+                    }
+                    ExactCandidateDecision::IndeterminateBoundary => {
+                        "comparison_exact_indeterminate_boundary"
+                    }
+                    ExactCandidateDecision::IncludesZero => "comparison_exact_includes_zero",
+                    ExactCandidateDecision::ExcludesZero => "comparison_exact_excludes_zero",
+                };
+                writeln!(rendered, "  {}", copy[key])?;
+            }
+            writeln!(rendered, "{}", copy["comparison_exact_positive_direction"])?;
+        }
+    }
+    writeln!(
+        rendered,
+        "Exact output digest: {}",
+        estimation.output_digest
+    )?;
+    Ok(rendered)
+}
+
+fn percent(count: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        count as f64 * 100.0 / total as f64
+    }
+}
+
+fn render_comparison_task_operation(
+    args: &InsightsArgs,
+    operation: LocalInsightsOperation,
+    json: bool,
+) -> Result<()> {
+    let response = execute(LocalInsightsRequest {
+        store_dir: args.store_dir.clone(),
+        operation,
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+    let copy = trace_commons_contributor::insights::service::ui_copy();
+    match response {
+        LocalInsightsResponse::ComparisonTaskList { tasks } => {
+            if tasks.is_empty() {
+                println!("{}", copy["comparison_task_empty"]);
+            }
+            for detail in tasks {
+                render_comparison_task(&detail.task, Some(&detail.stale_reasons), &copy)?;
+            }
+        }
+        LocalInsightsResponse::ComparisonTaskExplain { detail } => {
+            render_comparison_task(&detail.task, Some(&detail.stale_reasons), &copy)?
+        }
+        LocalInsightsResponse::ComparisonTask {
+            task,
+            mutation_effects,
+        }
+        | LocalInsightsResponse::ComparisonTaskDelete {
+            task,
+            mutation_effects,
+        } => {
+            render_comparison_task(&task, None, &copy)?;
+            render_mutation_effects(&mutation_effects);
+        }
+        _ => anyhow::bail!("insights-comparison-task-response-invalid"),
+    }
+    Ok(())
+}
+
+fn render_comparison_task(
+    task: &trace_commons_contributor::insights::comparison_tasks::LocalComparisonTaskV1,
+    reasons: Option<
+        &[trace_commons_contributor::insights::comparison_tasks::ComparisonTaskStaleReason],
+    >,
+    copy: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    println!("{} — {}", copy["comparison_task_title"], task.id);
+    println!(
+        "Revision: {} · Material revision: {}",
+        task.revision, task.material_revision
+    );
+    println!(
+        "{}: {}",
+        copy["comparison_task_material_digest"], task.material_digest
+    );
+    println!(
+        "{}",
+        if task
+            .context
+            .as_ref()
+            .is_some_and(|context| context.is_complete())
+        {
+            &copy["comparison_task_context_complete"]
+        } else {
+            &copy["comparison_task_context_incomplete"]
+        }
+    );
+    if let Some(outcome) = &task.outcome {
+        println!(
+            "User-reported outcome: {}",
+            serde_json::to_value(outcome.value)?
+                .as_str()
+                .unwrap_or("unknown")
+        );
+    } else {
+        println!("{}", copy["comparison_task_outcome_unassessed"]);
+    }
+    let confirmation_current = task
+        .independence_confirmation
+        .as_ref()
+        .is_some_and(|value| {
+            value.material_revision == task.material_revision
+                && value.material_digest == task.material_digest
+        });
+    println!(
+        "{}",
+        if confirmation_current {
+            &copy["comparison_task_confirmation_current"]
+        } else {
+            &copy["comparison_task_confirmation_missing"]
+        }
+    );
+    println!("{}", copy["comparison_task_attribution_pending"]);
+    if let Some(reasons) = reasons {
+        println!(
+            "Review reasons: {}",
+            reasons
+                .iter()
+                .filter_map(|reason| serde_json::to_value(reason).ok())
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn render_quarantine(quarantined: &QuarantineReport, json: bool) {
     if quarantined.is_empty() || json {
         return;
@@ -438,6 +1086,12 @@ fn render_quarantine(quarantined: &QuarantineReport, json: bool) {
     for id in &quarantined.episode_ids {
         println!("  unreadable episode {id}");
     }
+    for id in &quarantined.comparison_task_ids {
+        println!("  unreadable comparison task {id}");
+    }
+    for id in &quarantined.comparison_specification_ids {
+        println!("  unreadable comparison specification {id}");
+    }
 }
 
 fn render_mutation_effects(effects: &MutationEffects) {
@@ -447,6 +1101,16 @@ fn render_mutation_effects(effects: &MutationEffects) {
         for id in &effects.invalidated_episode_ids {
             println!("  {id}");
         }
+    }
+    for effect in &effects.stale_comparison_tasks {
+        let reasons = effect
+            .reasons
+            .iter()
+            .filter_map(|reason| serde_json::to_value(reason).ok())
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("Comparison task {} is stale: {reasons}", effect.task_id);
     }
 }
 
@@ -492,15 +1156,29 @@ fn render_episode_operation(
                 render(member, false)?;
             }
         }
-        LocalInsightsResponse::EpisodeDelete { episode } => {
+        LocalInsightsResponse::EpisodeDelete {
+            episode,
+            mutation_effects,
+        } => {
             println!("{}", copy["episode_deleted"]);
             render_episode(&episode, &copy)?;
+            render_mutation_effects(&mutation_effects);
         }
-        LocalInsightsResponse::EpisodeCreate { episode }
-        | LocalInsightsResponse::EpisodeReplaceMembers { episode }
-        | LocalInsightsResponse::EpisodeAnnotate { episode }
-        | LocalInsightsResponse::EpisodeClearAssessment { episode } => {
-            render_episode(&episode, &copy)?
+        LocalInsightsResponse::EpisodeCreate { episode } => render_episode(&episode, &copy)?,
+        LocalInsightsResponse::EpisodeReplaceMembers {
+            episode,
+            mutation_effects,
+        }
+        | LocalInsightsResponse::EpisodeAnnotate {
+            episode,
+            mutation_effects,
+        }
+        | LocalInsightsResponse::EpisodeClearAssessment {
+            episode,
+            mutation_effects,
+        } => {
+            render_episode(&episode, &copy)?;
+            render_mutation_effects(&mutation_effects);
         }
         _ => anyhow::bail!("insights-episode-response-invalid"),
     }
@@ -649,4 +1327,29 @@ fn render(insight: &LocalInsight, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qualified_exact_result_renders_conditional_orientation_and_statuses() {
+        let response: LocalInsightsResponse = serde_json::from_slice(include_bytes!(
+            "../../../fixtures/insights/comparison-estimator/schema2-qualified/preview-response.json"
+        ))
+        .unwrap();
+        let LocalInsightsResponse::ComparisonPreviewSpec { result, .. } = response else {
+            panic!("fixture must be a comparison preview")
+        };
+        let copy = trace_commons_contributor::insights::service::ui_copy();
+        let text = exact_estimation_text(&result, result.exact_estimation.as_ref().unwrap(), &copy)
+            .unwrap();
+        assert!(text.contains("model-b minus model-a"));
+        assert!(text.contains("Observed difference: +0.0000 percentage points"));
+        assert!(text.contains("Simultaneous interval:"));
+        assert!(text.contains("Interval too wide for a directional conclusion."));
+        assert!(text.contains("Accepted: 1/2"));
+        assert!(!text.contains("better model"));
+    }
 }

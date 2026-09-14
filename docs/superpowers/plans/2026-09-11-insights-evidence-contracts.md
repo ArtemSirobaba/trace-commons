@@ -12,6 +12,25 @@ references. Labels describe declarations, not verified serving identities.
 The caller must validate the source with its adapter before attaching the result,
 and compare the result's source format and digest when reading a saved cache.
 
+Version 2 observations from new Codex imports treat only official
+`turn_context.model` fields as declaration candidates. A Codex source with no
+turn contexts therefore has zero candidates rather than missing model metadata;
+its model answer remains unavailable. Session metadata and assistant messages
+do not declare a model under this version. Trajectory imports and previously
+saved version 1 observations keep their existing meaning. Reads and unrelated
+mutations do not reinterpret version 1 evidence; an explicit reimport writes
+version 2. A nested model-observation version above 1 requires store version 11,
+and the store's own version advances with it. An older client therefore refuses
+the whole store once with `insights_store_version_unsupported`, rather than
+accepting the store and then rejecting individual snapshots at read time. No
+automatic downgrade is provided.
+
+Rust is the single validator of this contract. Each saved observation carries a
+`contract` verdict that Rust recomputes on every deserialization and never
+reads from the wire, and the native shells consume that verdict instead of
+re-deriving counters, ordering, declaration kinds or label charset. A verdict a
+shell does not know is a contract newer than that shell, and fails closed there.
+
 `outcomes::inspect_git_commit(repository, object_id)` inspects an exact canonical
 lowercase 40- or 64-hex commit ID in an explicitly selected repository. It records
 only repository-path digest, object/tree/parent identifiers, inspection time,

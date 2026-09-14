@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use trace_commons_protocol::insights_pricing::{BillableTokenCategory, PricingAccounting};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -30,6 +31,86 @@ pub enum NativeTokenCounts {
         cache_creation_input: u64,
         output: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("insights_usage_accounting_invalid")]
+pub struct InvalidTokenAccounting;
+
+impl NativeTokenCounts {
+    pub fn validate_accounting(&self) -> std::result::Result<(), InvalidTokenAccounting> {
+        if let Self::Codex {
+            input,
+            cached_input,
+            output,
+            reasoning_output,
+            total,
+        } = *self
+            && (cached_input > input
+                || reasoning_output > output
+                || input.checked_add(output) != Some(total))
+        {
+            return Err(InvalidTokenAccounting);
+        }
+        Ok(())
+    }
+
+    /// The pricing accounting family these native counters belong to. A
+    /// provider billed nothing by virtue of this mapping.
+    pub const fn pricing_accounting(&self) -> PricingAccounting {
+        match self {
+            Self::Codex { .. } => PricingAccounting::Codex,
+            Self::ClaudeCode { .. } => PricingAccounting::ClaudeCode,
+        }
+    }
+
+    /// Return disjoint native categories in a stable order. Codex cache and
+    /// reasoning counts are subsets; Claude cache categories are independent.
+    /// No price, model, timestamp, session completeness, or billed-cost claim
+    /// follows from successful decomposition.
+    ///
+    /// These are the priceable categories themselves, not a parallel local
+    /// enum: pairing a count with its rate is a type match, never a position.
+    /// The order always equals `pricing_accounting().required_categories()`,
+    /// which `accounting_components_are_the_priceable_categories` pins.
+    pub fn accounting_components(
+        &self,
+    ) -> std::result::Result<Vec<(BillableTokenCategory, u64)>, InvalidTokenAccounting> {
+        use BillableTokenCategory::*;
+        self.validate_accounting()?;
+        match *self {
+            Self::Codex {
+                input,
+                cached_input,
+                output,
+                ..
+            } => {
+                let uncached = input
+                    .checked_sub(cached_input)
+                    .ok_or(InvalidTokenAccounting)?;
+                Ok(vec![
+                    (UncachedInput, uncached),
+                    (CachedInput, cached_input),
+                    (Output, output),
+                ])
+            }
+            Self::ClaudeCode {
+                input,
+                cache_read_input,
+                cache_creation_input,
+                output,
+            } => {
+                // Each category can be valid on its own even if their sum does
+                // not fit u64. Monetary aggregation must use checked wide math.
+                Ok(vec![
+                    (UncachedInput, input),
+                    (CacheReadInput, cache_read_input),
+                    (CacheCreationInput, cache_creation_input),
+                    (Output, output),
+                ])
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,12 +180,16 @@ fn counts(source: UsageSource, value: &Value) -> Option<[u64; 5]> {
     for (i, key) in keys.iter().enumerate() {
         result[i] = value.get(key)?.as_u64()?;
     }
-    if source == UsageSource::Codex
-        && (result[1] > result[0]
-            || result[3] > result[2]
-            || result[0].checked_add(result[2])? != result[4])
-    {
-        return None;
+    if source == UsageSource::Codex {
+        NativeTokenCounts::Codex {
+            input: result[0],
+            cached_input: result[1],
+            output: result[2],
+            reasoning_output: result[3],
+            total: result[4],
+        }
+        .validate_accounting()
+        .ok()?;
     }
     if source == UsageSource::ClaudeCode {
         result[4] = 0;
@@ -268,6 +353,119 @@ pub fn extract_usage(source: UsageSource, bytes: &[u8]) -> Result<UsageSummary> 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The decomposition and the pricing rate vector are one enum, so a count
+    /// meets its rate by category. Reordering either side moves this pin.
+    #[test]
+    fn accounting_components_are_the_priceable_categories() {
+        use BillableTokenCategory::*;
+        for (counts, accounting, expected) in [
+            (
+                NativeTokenCounts::Codex {
+                    input: 0,
+                    cached_input: 0,
+                    output: 0,
+                    reasoning_output: 0,
+                    total: 0,
+                },
+                PricingAccounting::Codex,
+                vec![UncachedInput, CachedInput, Output],
+            ),
+            (
+                NativeTokenCounts::ClaudeCode {
+                    input: 0,
+                    cache_read_input: 0,
+                    cache_creation_input: 0,
+                    output: 0,
+                },
+                PricingAccounting::ClaudeCode,
+                vec![UncachedInput, CacheReadInput, CacheCreationInput, Output],
+            ),
+        ] {
+            assert_eq!(counts.pricing_accounting(), accounting);
+            let produced: Vec<_> = counts
+                .accounting_components()
+                .unwrap()
+                .into_iter()
+                .map(|(category, _)| category)
+                .collect();
+            assert_eq!(produced, expected, "pinned decomposition order");
+            assert_eq!(
+                produced,
+                accounting.required_categories(),
+                "decomposition must equal the rate vector the calculator requires"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_accounting_never_adds_subset_counters_again() {
+        use BillableTokenCategory::*;
+        let counts = NativeTokenCounts::Codex {
+            input: 100,
+            cached_input: 80,
+            output: 40,
+            reasoning_output: 30,
+            total: 140,
+        };
+        assert_eq!(
+            counts.accounting_components().unwrap(),
+            vec![(UncachedInput, 20), (CachedInput, 80), (Output, 40)]
+        );
+        for (input, cached, output, reasoning, total) in [
+            (1, 2, 0, 0, 1),
+            (0, 0, 1, 2, 1),
+            (1, 0, 2, 0, 4),
+            (u64::MAX, 0, 1, 0, 0),
+        ] {
+            let counts = NativeTokenCounts::Codex {
+                input,
+                cached_input: cached,
+                output,
+                reasoning_output: reasoning,
+                total,
+            };
+            assert_eq!(counts.accounting_components(), Err(InvalidTokenAccounting));
+        }
+        let zero = NativeTokenCounts::Codex {
+            input: 0,
+            cached_input: 0,
+            output: 0,
+            reasoning_output: 0,
+            total: 0,
+        };
+        assert_eq!(
+            zero.accounting_components().unwrap(),
+            vec![(UncachedInput, 0), (CachedInput, 0), (Output, 0)]
+        );
+    }
+
+    #[test]
+    fn claude_accounting_keeps_independent_cache_categories() {
+        use BillableTokenCategory::*;
+        let counts = NativeTokenCounts::ClaudeCode {
+            input: 3,
+            cache_read_input: 100,
+            cache_creation_input: 50,
+            output: 7,
+        };
+        assert_eq!(
+            counts.accounting_components().unwrap(),
+            vec![
+                (UncachedInput, 3),
+                (CacheReadInput, 100),
+                (CacheCreationInput, 50),
+                (Output, 7)
+            ]
+        );
+        let large = NativeTokenCounts::ClaudeCode {
+            input: u64::MAX,
+            cache_read_input: u64::MAX,
+            cache_creation_input: u64::MAX,
+            output: u64::MAX,
+        };
+        assert_eq!(large.accounting_components().unwrap().len(), 4);
+    }
     fn run(source: UsageSource, rows: Vec<Value>) -> UsageSummary {
         extract_usage(
             source,

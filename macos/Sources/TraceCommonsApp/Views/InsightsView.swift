@@ -1,20 +1,52 @@
 import SwiftUI
 import TCBridge
+import TCShellCore
 import UniformTypeIdentifiers
 
 struct InsightsView: View {
-    @State private var model = InsightsModel()
+    @State private var model: InsightsModel
+    @State private var comparisonModel: ComparisonTasksModel
+    @State private var specificationModel: ComparisonSpecificationsModel
+    private let storeSelection: InsightsStoreSelection
+    private let storeCopy: [String: String]
     @State private var choosingFile = false
     @State private var source = "codex"
 
+    @MainActor init(storeSelection: InsightsStoreSelection = .standard,
+                    storeCopy: [String: String]? = TCInsights.copy()) {
+        self.storeSelection = storeSelection
+        self.storeCopy = storeCopy ?? [:]
+        let router = InsightsServiceRouter(selection: storeSelection)
+        let service: InsightsModel.Service = { request in try await router.call(request) }
+        _model = State(initialValue: InsightsModel(service: service))
+        _comparisonModel = State(initialValue: ComparisonTasksModel(service: service))
+        _specificationModel = State(initialValue: ComparisonSpecificationsModel(service: service))
+    }
+
+    @ViewBuilder
     var body: some View {
+        if let refusal = storeSelection.refusal {
+            ContentUnavailableView(storeCopy["insights_store_unavailable"] ?? "",
+                                   systemImage: "externaldrive.badge.exclamationmark",
+                                   description: Text(refusalMessage(refusal)))
+        } else {
+            content
+        }
+    }
+
+    private var content: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if case .custom(let path) = storeSelection {
+                        Text((storeCopy["insights_store_title"] ?? "") + ": " + path)
+                            .font(.caption).textSelection(.enabled)
+                    }
                     Text(model.text("intro"))
                     HStack {
                         Picker(model.text("source"), selection: $source) {
                             Text(model.text("codex")).tag("codex")
+                            Text(model.text("claude_code")).tag("claude_code")
                             Text(model.text("trajectory")).tag("trajectory")
                         }.frame(maxWidth: 260)
                         Button(model.text("choose_file")) { choosingFile = true }
@@ -65,6 +97,14 @@ struct InsightsView: View {
                     Divider()
                     InsightsEpisodesView(model: model)
                     Divider()
+                    ComparisonTasksView(model: comparisonModel, episodes: model.episodes, copy: model.copy,
+                                        openEpisode: model.openEpisode, openSnapshot: model.explain)
+                    Divider()
+                    ComparisonSpecificationsView(model: specificationModel, copy: model.copy,
+                                                 openTask: comparisonModel.select)
+                    Divider()
+                    InsightCardsView(model: model)
+                    Divider()
                     Text(model.text("saved")).font(.headline)
                     if model.snapshots.isEmpty { Text(model.text("empty")) }
                     ForEach(model.snapshots) { insight in
@@ -88,7 +128,38 @@ struct InsightsView: View {
             if case .success(let file) = result { model.analyze(file: file, source: source) }
         }
         .onAppear { model.open() }
-        .onDisappear { model.close() }
+        .onAppear { comparisonModel.open() }
+        .onAppear { specificationModel.open() }
+        .onChange(of: comparisonTaskVersions) { _, _ in
+            specificationModel.sourceEvidenceChanged(tasks: comparisonModel.tasks, snapshots: model.snapshots)
+        }
+        .onChange(of: model.snapshots.map(\.id)) { _, _ in updateSpecificationSources() }
+        .onChange(of: model.comparisonInvalidationGeneration) { _, _ in
+            comparisonModel.upstreamEvidenceChanged()
+            specificationModel.upstreamEvidenceChanged()
+        }
+        .onDisappear { model.close(); comparisonModel.close(); specificationModel.close() }
+    }
+    private func refusalMessage(_ refusal: InsightsStoreSelection.Refusal) -> String {
+        switch refusal {
+        case .duplicateOption: return storeCopy["insights_store_duplicate"] ?? ""
+        case .missingPath: return storeCopy["insights_store_missing_path"] ?? ""
+        case .relativePath: return storeCopy["insights_store_relative_path"] ?? ""
+        case .pathMissing: return storeCopy["insights_store_path_missing"] ?? ""
+        case .notADirectory: return storeCopy["insights_store_not_directory"] ?? ""
+        }
+    }
+    private func updateSpecificationSources() {
+        specificationModel.updateSources(tasks: comparisonModel.tasks, snapshots: model.snapshots)
+    }
+    private var comparisonTaskVersions: [String] {
+        comparisonModel.tasks.map { detail in
+            let context = detail.task.context
+            return [detail.id, String(detail.task.revision), detail.task.material_digest,
+                    context?.configuration_fingerprint ?? "", context?.task_date ?? "",
+                    detail.task.outcome?.recorded_at ?? "", detail.task.independence_confirmation?.confirmed_at ?? "",
+                    detail.stale_reasons.map(\.rawValue).joined(separator: ",")].joined(separator: ":")
+        }
     }
     private var assessment: some View {
         VStack(alignment: .leading) {
