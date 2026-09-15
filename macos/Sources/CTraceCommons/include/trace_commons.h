@@ -293,6 +293,70 @@ tc_handle*  tc_daemon_start(const char* config_dir, char** err);
  */
 tc_handle*  tc_daemon_start_with_settings(const char* config_dir, const char* settings_json, char** err);
 
+/* Attach to a daemon ALREADY RUNNING in another process, over its socket.
+ *
+ * This is the answer to tc_daemon_start reporting "already-running". That
+ * label means another process holds daemon.lock, which is documented above
+ * as "not an error to repair: the daemon the contributor wants is already
+ * up" -- and until this call existed a host had no way to act on it, so a
+ * shell that hit it told the contributor their watcher was not running
+ * while it was running. A host that treats "already-running" as a dead end
+ * is stating something false; this is the call that makes it true instead.
+ *
+ * The returned handle is a tc_handle* in every respect that matters:
+ * tc_call, tc_subscribe, tc_unsubscribe and tc_handle_free all take it, and
+ * tc_handle_free remains the only function that frees it. Three deliberate
+ * differences from a started handle, each REPORTED rather than silently
+ * degraded:
+ *
+ *   - tc_daemon_stop does NOT stop the daemon; it stops listening to it.
+ *     The process on the other end may be a service-managed daemon or
+ *     another window, and a shell that did not start it does not get to end
+ *     it. tc_call(h, "shutdown", ...) is refused for the same reason, with
+ *     the error frame code "refused" and message "attached-stop-refused".
+ *   - tc_preview_open and tc_preview_turns_json are refused with
+ *     "preview-requires-embedded". The redacted BODY is this ABI's
+ *     in-process content exemption; the socket's "preview" carries the
+ *     summary only, and answering with a summary where a body was asked for
+ *     would be a content promise this path cannot keep.
+ *   - Events arrive over the socket, so a subscriber DOES receive the
+ *     "snapshot" frame the daemon sends a client that has just subscribed --
+ *     the courtesy tc_subscribe's in-process path never gets.
+ *
+ * Returns NULL and sets *err (if err is non-NULL) to a fixed label on
+ * failure. *err is an owned string; free it with tc_string_free.
+ *
+ *   "no-daemon-listening"          nothing is listening on this state
+ *                                  directory's endpoint -- no daemon was
+ *                                  ever started, or a crashed one left the
+ *                                  socket file behind with nothing behind
+ *                                  it. Deliberately distinct from
+ *                                  "already-running": a host that gets
+ *                                  "already-running" from a start and then
+ *                                  this from an attach is looking at a
+ *                                  daemon that exited in between.
+ *   "state-directory-not-writable" the state directory could not be opened.
+ *   "attach-failed"                the endpoint was reached and the
+ *                                  connection could not be held.
+ *   "attach-unsupported"           this platform's daemon endpoint cannot
+ *                                  carry a held-open connection at all.
+ *                                  Windows today: its named pipe is a
+ *                                  synchronous handle, so a client that
+ *                                  reads it from one thread while writing
+ *                                  from another never completes a round
+ *                                  trip. Nothing is wrong with the machine
+ *                                  or the daemon and retrying will never
+ *                                  help; a host there must treat
+ *                                  "already-running" as terminal, as it did
+ *                                  before this call existed.
+ *
+ * Unlike tc_daemon_start, this does NOT evaluate the session roots: the
+ * daemon being attached to has already made that decision for itself, and
+ * re-deciding it here would refuse a running watcher on the strength of a
+ * settings file it is not using.
+ */
+tc_handle*  tc_daemon_attach(const char* config_dir, char** err);
+
 /* Describe the session stores on this machine, so a roots screen can ask the
  * contributor about something specific rather than showing an empty field.
  *
@@ -584,6 +648,28 @@ char*       tc_routing_last_checked(const char* when);
  * Returns NULL only on a caught panic.
  */
 char*       tc_private_inference_copy(void);
+
+/* Every fixed word for a watcher another process is already running, as one
+ * owned JSON object. Free it with tc_string_free.
+ *
+ * This is the surface a host renders after tc_daemon_start answers
+ * "already-running" and tc_daemon_attach succeeds: the banner saying this
+ * window is driving somebody else's watcher, plus one sentence per fixed
+ * start-failure label. Keys:
+ *
+ *   attached_title, attached_detail,
+ *   already_running, no_daemon_listening,
+ *   state_directory_not_writable, settings_unreadable, ipc_bind_failed
+ *
+ * There is deliberately NO sentence for "roots-not-declared" (it has its own
+ * screen) or for "daemon-start-failed" (opaque by construction). A host that
+ * meets a label with no sentence here must treat it as daemon-start-failed
+ * rather than display it.
+ *
+ * Needs no handle because it describes the build. Returns NULL only on a
+ * caught panic.
+ */
+char*       tc_attach_copy(void);
 
 /* Every fixed word on owned session detail and reviewed publication, as one
  * OWNED JSON object; free it with tc_string_free. Needs no handle because it
