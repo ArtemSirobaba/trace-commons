@@ -5992,7 +5992,10 @@ impl TraceCorpusStore for PgBackend {
                         vector_entry_id, credit_withheld_reason, \
                         peak_perplexity_micros, peak_novelty_micros, chunk_count, chunks_capped, \
                         total_chunk_count, qualifying_token_fraction_micros, composite_score_micros, \
-                        vector_index_snapshot_id, index_cardinality_at_scoring \
+                        vector_index_snapshot_id, index_cardinality_at_scoring, \
+                        agent_prose_perplexity_micros, agent_prose_tokens, \
+                        tool_result_perplexity_micros, tool_result_tokens, \
+                        attributed_token_fraction_micros \
                  FROM trace_gate_decisions \
                  WHERE tenant_id = $1 \
                    AND vector_entry_id IS NOT NULL \
@@ -6012,7 +6015,10 @@ impl TraceCorpusStore for PgBackend {
                         vector_entry_id, credit_withheld_reason, \
                         peak_perplexity_micros, peak_novelty_micros, chunk_count, chunks_capped, \
                         total_chunk_count, qualifying_token_fraction_micros, composite_score_micros, \
-                        vector_index_snapshot_id, index_cardinality_at_scoring \
+                        vector_index_snapshot_id, index_cardinality_at_scoring, \
+                        agent_prose_perplexity_micros, agent_prose_tokens, \
+                        tool_result_perplexity_micros, tool_result_tokens, \
+                        attributed_token_fraction_micros \
                  FROM trace_gate_decisions \
                  WHERE tenant_id = $1 \
                    AND vector_entry_id IS NOT NULL \
@@ -6050,6 +6056,11 @@ impl TraceCorpusStore for PgBackend {
                 composite_score_micros: row.get("composite_score_micros"),
                 vector_index_snapshot_id: row.get("vector_index_snapshot_id"),
                 index_cardinality_at_scoring: row.get("index_cardinality_at_scoring"),
+                agent_prose_perplexity_micros: row.get("agent_prose_perplexity_micros"),
+                agent_prose_tokens: row.get("agent_prose_tokens"),
+                tool_result_perplexity_micros: row.get("tool_result_perplexity_micros"),
+                tool_result_tokens: row.get("tool_result_tokens"),
+                attributed_token_fraction_micros: row.get("attributed_token_fraction_micros"),
             })
             .collect();
         tx.commit().await.map_err(DatabaseError::Postgres)?;
@@ -6103,8 +6114,11 @@ impl TraceCorpusStore for PgBackend {
                  peak_perplexity_micros, peak_novelty_micros, chunk_count, chunks_capped,
                  total_chunk_count, qualifying_token_fraction_micros,
                  composite_score_micros,
-                 vector_index_snapshot_id, index_cardinality_at_scoring
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
+                 vector_index_snapshot_id, index_cardinality_at_scoring,
+                 agent_prose_perplexity_micros, agent_prose_tokens,
+                 tool_result_perplexity_micros, tool_result_tokens,
+                 attributed_token_fraction_micros
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)",
             &[
                 &tenant_id,
                 &decision.decision_id,
@@ -6131,6 +6145,11 @@ impl TraceCorpusStore for PgBackend {
                 &decision.composite_score_micros,
                 &decision.vector_index_snapshot_id,
                 &decision.index_cardinality_at_scoring,
+                &decision.agent_prose_perplexity_micros,
+                &decision.agent_prose_tokens,
+                &decision.tool_result_perplexity_micros,
+                &decision.tool_result_tokens,
+                &decision.attributed_token_fraction_micros,
             ],
         )
         .await
@@ -6157,8 +6176,11 @@ impl TraceCorpusStore for PgBackend {
                  peak_perplexity_micros, peak_novelty_micros, chunk_count, chunks_capped,
                  total_chunk_count, qualifying_token_fraction_micros,
                  composite_score_micros,
-                 vector_index_snapshot_id, index_cardinality_at_scoring
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
+                 vector_index_snapshot_id, index_cardinality_at_scoring,
+                 agent_prose_perplexity_micros, agent_prose_tokens,
+                 tool_result_perplexity_micros, tool_result_tokens,
+                 attributed_token_fraction_micros
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)",
             &[
                 &tenant_id,
                 &decision.decision_id,
@@ -6185,6 +6207,11 @@ impl TraceCorpusStore for PgBackend {
                 &decision.composite_score_micros,
                 &decision.vector_index_snapshot_id,
                 &decision.index_cardinality_at_scoring,
+                &decision.agent_prose_perplexity_micros,
+                &decision.agent_prose_tokens,
+                &decision.tool_result_perplexity_micros,
+                &decision.tool_result_tokens,
+                &decision.attributed_token_fraction_micros,
             ],
         )
         .await
@@ -6293,6 +6320,48 @@ impl TraceCorpusStore for PgBackend {
                 &perplexity_micros,
                 &peak_perplexity_micros,
                 &perplexity_passed,
+            ],
+        )
+        .await
+        .map_err(DatabaseError::Postgres)?;
+        tx.commit().await.map_err(DatabaseError::Postgres)?;
+        Ok(())
+    }
+
+    async fn update_trace_gate_decision_author_perplexity(
+        &self,
+        tenant_id: &str,
+        submission_id: Uuid,
+        columns: [Option<i64>; 5],
+    ) -> Result<(), DatabaseError> {
+        let mut client = self.trace_pool().get().await?;
+        let tx = Self::begin_trace_tenant_transaction(&mut client, tenant_id).await?;
+        // The five V73 columns and nothing else, on the latest decision row
+        // only -- the same row selection as
+        // `update_trace_gate_decision_perplexity`, for the same reason: a
+        // submission can own several rows and the older ones carry an older
+        // gate version stamp. Leaving `perplexity_micros` /
+        // `perplexity_passed` alone is the point: a backfill scored by a
+        // different model must not rewrite what the row was gated on.
+        tx.execute(
+            "UPDATE trace_gate_decisions
+                SET agent_prose_perplexity_micros = $3,
+                    agent_prose_tokens = $4,
+                    tool_result_perplexity_micros = $5,
+                    tool_result_tokens = $6,
+                    attributed_token_fraction_micros = $7
+             WHERE tenant_id = $1 AND decision_id = (
+                 SELECT decision_id FROM trace_gate_decisions
+                  WHERE tenant_id = $1 AND submission_id = $2
+                  ORDER BY decided_at DESC LIMIT 1)",
+            &[
+                &tenant_id,
+                &submission_id,
+                &columns[0],
+                &columns[1],
+                &columns[2],
+                &columns[3],
+                &columns[4],
             ],
         )
         .await
@@ -6623,7 +6692,10 @@ impl TraceCorpusStore for PgBackend {
                         d.peak_perplexity_micros, d.peak_novelty_micros, d.chunk_count, d.chunks_capped,
                         d.total_chunk_count, d.composite_score_micros,
                         d.vector_index_snapshot_id, d.index_cardinality_at_scoring,
-                        d.qualifying_token_fraction_micros
+                        d.qualifying_token_fraction_micros,
+                        d.agent_prose_perplexity_micros, d.agent_prose_tokens,
+                        d.tool_result_perplexity_micros, d.tool_result_tokens,
+                        d.attributed_token_fraction_micros
                  FROM trace_gate_decisions d
                  JOIN trace_submissions s
                    ON s.tenant_id = d.tenant_id AND s.submission_id = d.submission_id
@@ -6665,6 +6737,12 @@ impl TraceCorpusStore for PgBackend {
             // every read here is positional, so inserting mid-list would
             // silently re-point the indices above it.
             qualifying_token_fraction_micros: row.get(23),
+            // Appended after it for the same reason: positional reads.
+            agent_prose_perplexity_micros: row.get(24),
+            agent_prose_tokens: row.get(25),
+            tool_result_perplexity_micros: row.get(26),
+            tool_result_tokens: row.get(27),
+            attributed_token_fraction_micros: row.get(28),
         }))
     }
 }

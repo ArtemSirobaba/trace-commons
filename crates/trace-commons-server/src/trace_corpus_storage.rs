@@ -1936,6 +1936,16 @@ pub struct TraceGateDecisionRow {
     /// or calibration will read every unmeasured row as the worst possible
     /// observation.
     pub qualifying_token_fraction_micros: Option<i64>,
+    /// Per-author perplexity (migration V73). Shadow mode. All five are
+    /// `None` when nothing was attributed -- pre-V73 rows and backends that
+    /// report no token lengths. A `*_perplexity_micros` is also `None` when
+    /// that author had no attributed tokens. Readers MUST NOT default any of
+    /// them.
+    pub agent_prose_perplexity_micros: Option<i64>,
+    pub agent_prose_tokens: Option<i64>,
+    pub tool_result_perplexity_micros: Option<i64>,
+    pub tool_result_tokens: Option<i64>,
+    pub attributed_token_fraction_micros: Option<i64>,
     /// The composite credit-quality score `q` * 1e6 as computed at scoring
     /// time under the calibration active then (migration V53, #199).
     ///
@@ -3048,6 +3058,32 @@ pub trait TraceCorpusStore: Send + Sync {
         WARNED.call_once(|| {
             tracing::warn!(
                 "update_trace_gate_decision_perplexity called on a backend without a real impl"
+            );
+        });
+        Ok(())
+    }
+
+    /// Write ONLY the five per-author perplexity columns (migration V73) on
+    /// the latest decision row for `submission_id`, in migration order:
+    /// agent-prose perplexity, agent-prose tokens, tool-result perplexity,
+    /// tool-result tokens, attributed fraction. Every other column --
+    /// including `perplexity_micros`, `peak_perplexity_micros` and
+    /// `perplexity_passed` -- is left untouched, so a backfill scored by a
+    /// different model than the row was gated under cannot rewrite gating
+    /// history. Implementations MUST scope the update by `tenant_id`.
+    ///
+    /// Defaults to a log-once warning + no-op, as
+    /// `update_trace_gate_decision_perplexity` does and for the same reason.
+    async fn update_trace_gate_decision_author_perplexity(
+        &self,
+        _tenant_id: &str,
+        _submission_id: Uuid,
+        _columns: [Option<i64>; 5],
+    ) -> Result<(), DatabaseError> {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "update_trace_gate_decision_author_perplexity called on a backend without a real impl"
             );
         });
         Ok(())

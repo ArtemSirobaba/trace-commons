@@ -51142,6 +51142,9 @@ async fn evaluate_and_record_gate(
         i64::try_from(decision.novelty_score_micros).unwrap_or(i64::MAX),
         &trace_commons_server::credit_quality::CREDIT_QUALITY_ACTIVE,
     );
+    let author_cols = trace_commons_server::trace_gate_service::author_perplexity_columns(
+        decision.author_perplexity.as_ref(),
+    );
     let row = StorageTraceGateDecisionRow {
         decision_id,
         submission_id,
@@ -51175,6 +51178,14 @@ async fn evaluate_and_record_gate(
         qualifying_token_fraction_micros: decision
             .qualifying_token_fraction_micros
             .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+        // Per-author perplexity (migration V73). Shadow mode, as above:
+        // recorded here, read by nothing that decides anything. All `None`
+        // when the gate service attributed nothing -- unknown, not zero.
+        agent_prose_perplexity_micros: author_cols[0],
+        agent_prose_tokens: author_cols[1],
+        tool_result_perplexity_micros: author_cols[2],
+        tool_result_tokens: author_cols[3],
+        attributed_token_fraction_micros: author_cols[4],
         // Prospective gate-utility instrumentation (#199).
         composite_score_micros: Some(composite.q_micros),
         // Reported by the index, not derived here: `None` when the configured
@@ -51618,9 +51629,53 @@ async fn requeue_pii_backstop_handler(
 /// (useful for a `?limit=5` pilot smoke before a full pass); absent means the
 /// whole decision backlog.
 #[derive(Debug, Deserialize)]
+// A mistyped `author_only` must be refused, not read as the default: the
+// default is a FULL re-score, which rewrites `perplexity_passed`, and the
+// route acknowledges before it works.
+#[serde(deny_unknown_fields)]
 struct RescorePerplexityQuery {
     #[serde(default)]
     limit: Option<i64>,
+    /// Backfill the per-author perplexity columns (migration V73) only;
+    /// never touch whole-trace perplexity or `perplexity_passed`. This is the
+    /// mode to use on rows gated under a scorer model that has since changed:
+    /// a full re-score would re-derive `perplexity_passed` under the new
+    /// model and silently rewrite gating history. Absent means `false`,
+    /// which is the route's behavior before this parameter existed.
+    #[serde(default)]
+    author_only: bool,
+    /// Calibration mode: score every decided submission exactly as a
+    /// re-score would, write NOTHING, and log aggregate distributions only.
+    /// This is how a floor is recalibrated for a new scorer model without
+    /// rewriting the gating history it is measured against. Wins over
+    /// `author_only`: a dry run writes nothing whatever else was asked for.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Which columns a re-score pass writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RescoreMode {
+    /// Whole-trace perplexity, the pass flag, and the per-author columns.
+    Full,
+    /// The five per-author columns only; never erases (see
+    /// `RescoreOneOutcome::AuthorUnattributed`).
+    AuthorOnly,
+    /// Nothing. Scores are collected and summarized, never stored.
+    DryRun,
+}
+
+impl RescorePerplexityQuery {
+    fn mode(&self) -> RescoreMode {
+        if self.dry_run {
+            RescoreMode::DryRun
+        } else if self.author_only {
+            RescoreMode::AuthorOnly
+        } else {
+            RescoreMode::Full
+        }
+    }
 }
 
 /// Hash-only acknowledgement for the perplexity re-score admin route. The work
@@ -51629,6 +51684,9 @@ struct RescorePerplexityQuery {
 struct RescorePerplexityAck {
     accepted: bool,
     limit: Option<i64>,
+    /// The mode the pass was started in. The work is fire-and-forget, so
+    /// this is the operator's only confirmation of which columns it writes.
+    mode: RescoreMode,
 }
 
 /// Running tally for one perplexity re-score pass.
@@ -51638,6 +51696,54 @@ struct RescorePerplexitySummary {
     rescored: usize,
     /// Submissions skipped because load/scoring/update failed (left as-is).
     failed: usize,
+    /// Author-only mode: submissions scored successfully for which nothing
+    /// could be attributed, so nothing was written. Not a failure, but not a
+    /// backfill either -- a pass that reports only this has a scorer that
+    /// supplies no usable token lengths.
+    author_unattributed: usize,
+    /// Dry-run mode only: every score the pass computed, held in memory for
+    /// the length of the pass and summarized into aggregates when it ends.
+    /// Never persisted and never logged row by row.
+    dry_run: Option<DryRunScores>,
+}
+
+/// Scores collected by a dry-run pass. Whole-trace vectors have one entry
+/// per scored submission; per-author vectors only where that author had
+/// attributed tokens.
+#[derive(Debug, Default)]
+struct DryRunScores {
+    perplexity_micros: Vec<u64>,
+    peak_perplexity_micros: Vec<u64>,
+    agent_prose_perplexity_micros: Vec<u64>,
+    agent_prose_tokens: Vec<u64>,
+    tool_result_perplexity_micros: Vec<u64>,
+    attributed_token_fraction_micros: Vec<u64>,
+    /// Scored submissions for which nothing could be attributed.
+    author_unattributed: usize,
+}
+
+impl DryRunScores {
+    fn record(
+        &mut self,
+        outcome: &trace_commons_server::trace_gate_service::PerplexityOnlyGateOutcome,
+    ) {
+        self.perplexity_micros.push(outcome.perplexity_micros);
+        self.peak_perplexity_micros
+            .push(outcome.peak_perplexity_micros);
+        let Some(ap) = outcome.author_perplexity.as_ref() else {
+            self.author_unattributed += 1;
+            return;
+        };
+        self.attributed_token_fraction_micros
+            .push(ap.attributed_token_fraction_micros);
+        self.agent_prose_tokens.push(ap.agent_prose_tokens);
+        if let Some(v) = ap.agent_prose_perplexity_micros {
+            self.agent_prose_perplexity_micros.push(v);
+        }
+        if let Some(v) = ap.tool_result_perplexity_micros {
+            self.tool_result_perplexity_micros.push(v);
+        }
+    }
 }
 
 /// Re-score the perplexity of ONE already-decided submission and update only
@@ -51647,7 +51753,78 @@ struct RescorePerplexitySummary {
 /// query, no vector-index insert), then updates only `perplexity_micros`,
 /// `peak_perplexity_micros`, and `perplexity_passed`. Novelty, tail-fraction,
 /// vector-entry, gate status, and credit are never touched.
-async fn rescore_perplexity_one(state: &AppState, item: &GateWorkItem) -> anyhow::Result<()> {
+/// Candidate whole-trace floors a dry run reports the would-refuse share for,
+/// ascending. They bracket the 6.0 floor calibrated for the previous scorer
+/// model; the point of a dry run is to see where a new model's traces fall
+/// against them.
+const DRY_RUN_CANDIDATE_FLOORS_MICROS: [u64; 8] = [
+    1_500_000, 2_000_000, 2_500_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000, 8_000_000,
+];
+
+/// Below this many agent-prose tokens a per-author perplexity is too noisy
+/// to gate on; the report counts such rows so calibration can see how many
+/// traces a prose-based floor could not judge.
+const THIN_AGENT_PROSE_TOKENS: u64 = 200;
+
+/// Everything a dry run logs: aggregates only. Every summary withholds its
+/// percentiles below `rescore_distribution::MIN_ROWS_FOR_PERCENTILES`, and
+/// the floor shares are empty below it, so a small pass reports counts and
+/// nothing a row could be read out of.
+#[derive(Debug, Serialize)]
+struct DryRunReport {
+    whole_trace_perplexity: trace_commons_server::rescore_distribution::DistributionSummary,
+    peak_chunk_perplexity: trace_commons_server::rescore_distribution::DistributionSummary,
+    agent_prose_perplexity: trace_commons_server::rescore_distribution::DistributionSummary,
+    agent_prose_tokens: trace_commons_server::rescore_distribution::DistributionSummary,
+    tool_result_perplexity: trace_commons_server::rescore_distribution::DistributionSummary,
+    attributed_token_fraction: trace_commons_server::rescore_distribution::DistributionSummary,
+    /// `(candidate whole-trace floor, share of scored traces strictly below
+    /// it)`, both in micros, ascending by floor.
+    share_below_floor_micros: Vec<(u64, u64)>,
+    /// Attributed rows with fewer than `THIN_AGENT_PROSE_TOKENS` prose tokens.
+    thin_agent_prose_rows: usize,
+    author_unattributed: usize,
+}
+
+fn dry_run_report(scores: &DryRunScores) -> DryRunReport {
+    use trace_commons_server::rescore_distribution::{share_below_micros, summarize};
+    DryRunReport {
+        whole_trace_perplexity: summarize(&scores.perplexity_micros),
+        peak_chunk_perplexity: summarize(&scores.peak_perplexity_micros),
+        agent_prose_perplexity: summarize(&scores.agent_prose_perplexity_micros),
+        agent_prose_tokens: summarize(&scores.agent_prose_tokens),
+        tool_result_perplexity: summarize(&scores.tool_result_perplexity_micros),
+        attributed_token_fraction: summarize(&scores.attributed_token_fraction_micros),
+        share_below_floor_micros: DRY_RUN_CANDIDATE_FLOORS_MICROS
+            .iter()
+            .filter_map(|floor| {
+                share_below_micros(&scores.perplexity_micros, *floor).map(|s| (*floor, s))
+            })
+            .collect(),
+        thin_agent_prose_rows: scores
+            .agent_prose_tokens
+            .iter()
+            .filter(|t| **t < THIN_AGENT_PROSE_TOKENS)
+            .count(),
+        author_unattributed: scores.author_unattributed,
+    }
+}
+
+/// What one re-score wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescoreOneOutcome {
+    Updated,
+    /// Dry-run mode: scored, nothing written.
+    DryRunScored(trace_commons_server::trace_gate_service::PerplexityOnlyGateOutcome),
+    /// Author-only mode, and the scorer attributed nothing: nothing written.
+    AuthorUnattributed,
+}
+
+async fn rescore_perplexity_one(
+    state: &AppState,
+    item: &GateWorkItem,
+    mode: RescoreMode,
+) -> anyhow::Result<RescoreOneOutcome> {
     let db = state
         .db_mirror
         .as_ref()
@@ -51663,24 +51840,55 @@ async fn rescore_perplexity_one(state: &AppState, item: &GateWorkItem) -> anyhow
         &wrapped_dek,
         TraceArtifactKind::ContributionEnvelope,
     )?;
+    if mode == RescoreMode::DryRun {
+        // Before any storage call, so "writes nothing" is structural: a dry
+        // run never reaches code that can update a row.
+        return Ok(RescoreOneOutcome::DryRunScored(outcome));
+    }
+    let author_only = mode == RescoreMode::AuthorOnly;
     let perplexity_micros = i64::try_from(outcome.perplexity_micros).unwrap_or(i64::MAX);
     let peak_perplexity_micros =
         Some(i64::try_from(outcome.peak_perplexity_micros).unwrap_or(i64::MAX));
-    db.update_trace_gate_decision_perplexity(
+    let author_cols = trace_commons_server::trace_gate_service::author_perplexity_columns(
+        outcome.author_perplexity.as_ref(),
+    );
+    // A backfill can only add. In author-only mode a scorer that attributes
+    // nothing (no token lengths, or lengths that never tile) must not erase
+    // values an earlier pass computed; the pass counts it instead, so a
+    // backlog-wide "nothing attributed" is visible rather than reported as
+    // success.
+    if author_only && outcome.author_perplexity.is_none() {
+        return Ok(RescoreOneOutcome::AuthorUnattributed);
+    }
+    if !author_only {
+        db.update_trace_gate_decision_perplexity(
+            &item.tenant_id,
+            item.submission_id,
+            perplexity_micros,
+            peak_perplexity_micros,
+            outcome.perplexity_passed,
+        )
+        .await?;
+    }
+    // Both modes write the per-author columns: a full re-score is a superset
+    // of the author-only backfill. In full mode an absent value is written
+    // as NULL on purpose: the row's perplexity was just rewritten under the
+    // current scorer, so per-author values from an older scoring no longer
+    // describe the row and must not be left to disagree with it.
+    db.update_trace_gate_decision_author_perplexity(
         &item.tenant_id,
         item.submission_id,
-        perplexity_micros,
-        peak_perplexity_micros,
-        outcome.perplexity_passed,
+        author_cols,
     )
     .await?;
     // Hash-only: identify the submission by hash, never the perplexity value.
     tracing::info!(
         tenant_hash = %sha256_prefixed(&item.tenant_id),
         submission_hash = %sha256_prefixed(&item.submission_id.to_string()),
+        author_only,
         "perplexity re-score updated one submission"
     );
-    Ok(())
+    Ok(RescoreOneOutcome::Updated)
 }
 
 /// One perplexity re-score pass. Enumerates submissions that already have a gate
@@ -51692,6 +51900,7 @@ async fn rescore_perplexity_one(state: &AppState, item: &GateWorkItem) -> anyhow
 async fn run_rescore_perplexity_pass(
     state: Arc<AppState>,
     limit: Option<i64>,
+    mode: RescoreMode,
 ) -> anyhow::Result<RescorePerplexitySummary> {
     let db = state
         .db_mirror
@@ -51702,9 +51911,17 @@ async fn run_rescore_perplexity_pass(
         .list_submissions_with_gate_decision(effective_limit)
         .await?;
     let mut summary = RescorePerplexitySummary::default();
+    if mode == RescoreMode::DryRun {
+        summary.dry_run = Some(DryRunScores::default());
+    }
     for item in &items {
-        match rescore_perplexity_one(state.as_ref(), item).await {
-            Ok(()) => summary.rescored += 1,
+        match rescore_perplexity_one(state.as_ref(), item, mode).await {
+            Ok(RescoreOneOutcome::Updated) => summary.rescored += 1,
+            Ok(RescoreOneOutcome::AuthorUnattributed) => summary.author_unattributed += 1,
+            Ok(RescoreOneOutcome::DryRunScored(outcome)) => summary
+                .dry_run
+                .get_or_insert_with(DryRunScores::default)
+                .record(&outcome),
             Err(error) => {
                 summary.failed += 1;
                 tracing::warn!(
@@ -51749,13 +51966,25 @@ async fn rescore_perplexity_handler(
         ));
     }
     let limit = query.limit;
+    let mode = query.mode();
     let task_state = state.clone();
     tokio::spawn(async move {
-        match run_rescore_perplexity_pass(task_state, limit).await {
+        match run_rescore_perplexity_pass(task_state, limit, mode).await {
             Ok(summary) => {
                 tracing::info!(
                     rescored = summary.rescored,
                     failed = summary.failed,
+                    author_unattributed = summary.author_unattributed,
+                    // Aggregates only, and none at all for a small pass; see
+                    // `DryRunReport`. Empty outside dry-run mode.
+                    dry_run_report = %summary
+                        .dry_run
+                        .as_ref()
+                        .map(|scores| {
+                            serde_json::to_string(&dry_run_report(scores))
+                                .unwrap_or_else(|_| "unserializable".to_string())
+                        })
+                        .unwrap_or_default(),
                     "Trace Commons perplexity re-score pass completed"
                 );
             }
@@ -51770,6 +51999,7 @@ async fn rescore_perplexity_handler(
     Ok(Json(RescorePerplexityAck {
         accepted: true,
         limit,
+        mode,
     }))
 }
 
@@ -52728,6 +52958,12 @@ async fn score_one_submission(
                             // Same: no chunks were scored, so there is no
                             // per-chunk distribution to take a share of.
                             qualifying_token_fraction_micros: None,
+                            // Per-author perplexity (V73): absent here, never a real zero.
+                            agent_prose_perplexity_micros: None,
+                            agent_prose_tokens: None,
+                            tool_result_perplexity_micros: None,
+                            tool_result_tokens: None,
+                            attributed_token_fraction_micros: None,
                             // Not instrumented, and it never can be: this
                             // branch short-circuits before the gate service
                             // runs, so no composite was computed and no index
@@ -52999,6 +53235,8 @@ async fn gate_evaluate_worker_handler(
             // per-chunk scores the statistic is computed from, and the real
             // decision row already carries it. Unknown, not zero.
             qualifying_token_fraction_micros: None,
+            // Same again: the real decision row already carries it.
+            author_perplexity: None,
             chunk_vector_entries: Vec::new(),
             // This is a synthetic re-hydration of the already-persisted
             // decision for the credit-emission call below (no ciphertext or
