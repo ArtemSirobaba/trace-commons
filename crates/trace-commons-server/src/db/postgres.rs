@@ -6384,6 +6384,202 @@ mod tests {
         );
     }
 
+    /// A function may not carry a `SET <custom.parameter> = ...` clause.
+    ///
+    /// PostgreSQL checks that clause when the function is created, and for a
+    /// parameter it has no definition of -- every `trace_commons.*` setting --
+    /// it allows only a true superuser (on 15 and later, also a role holding
+    /// `SET` on that parameter, which only a superuser can grant). A database
+    /// migrated by its least-privileged owner, which is every managed
+    /// PostgreSQL and the shape `docs/operator/deployment.md` tells operators
+    /// to build, dies there with `permission denied to set parameter`. V64, V71
+    /// and V72 shipped six such clauses and no test noticed, because every
+    /// suite migrates as a superuser.
+    ///
+    /// Clearing the setting in the body with `set_config(name, '', true)` and
+    /// putting the caller's value back before returning does the same job and
+    /// needs no privilege. `a_non_superuser_owner_can_apply_every_migration` in
+    /// `tests/migration_atomicity_pg.rs` proves the point against a real
+    /// server; this pins it where no PostgreSQL runs.
+    ///
+    /// `SET search_path = ...` is a parameter PostgreSQL defines, so anyone may
+    /// attach it; the dot in the name is what marks a custom one. A clause has
+    /// no terminating `;` -- a `SET` statement inside a body does.
+    #[test]
+    fn no_migration_attaches_a_custom_parameter_to_a_function() {
+        assert!(
+            super::MIGRATIONS.len() >= 60,
+            "the MIGRATIONS table came back with {} rows: an empty or truncated \
+             table passes the check below vacuously",
+            super::MIGRATIONS.len()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (version, name, sql) in super::MIGRATIONS {
+            for (index, line) in sql.lines().enumerate() {
+                let normalized = line.trim().to_ascii_lowercase();
+                let mut words = normalized.split_whitespace();
+                if words.next() != Some("set") {
+                    continue;
+                }
+                let Some(parameter) = words.next() else {
+                    continue;
+                };
+                if parameter.contains('.') && !normalized.ends_with(';') {
+                    offenders.push(format!(
+                        "V{version} ({name}) line {}: {parameter}",
+                        index + 1
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these functions carry a SET clause for a custom parameter, which only a \
+             superuser may create; clear it in the body with set_config instead:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// `ALTER ROLE` may not name SUPERUSER, BYPASSRLS or REPLICATION, in either
+    /// polarity.
+    ///
+    /// PostgreSQL gates those on the attribute being mentioned, not on the value
+    /// asked for: `ALTER ROLE r NOSUPERUSER` is refused to everyone but a
+    /// superuser -- `must be superuser to alter superuser roles or change
+    /// superuser attribute` -- although it could only ever take the privilege
+    /// away. V69 and V71 used it to pin five roles down after creating them,
+    /// which stopped a non-superuser owner as surely as the `SET` clause did.
+    ///
+    /// The intent was sound: a role of that name might already exist on the
+    /// server with more than the migration would have given it. So check the
+    /// catalog and refuse, which anyone may do, instead of coercing, which only
+    /// a superuser may. `CREATE ROLE ... NOBYPASSRLS` is not affected; creation
+    /// is gated on the value.
+    #[test]
+    fn no_migration_alters_a_role_attribute_reserved_to_superusers() {
+        const RESERVED: &[&str] = &[
+            "superuser",
+            "nosuperuser",
+            "bypassrls",
+            "nobypassrls",
+            "replication",
+            "noreplication",
+        ];
+
+        assert!(
+            super::MIGRATIONS.len() >= 60,
+            "the MIGRATIONS table came back with {} rows: an empty or truncated \
+             table passes the check below vacuously",
+            super::MIGRATIONS.len()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (version, name, sql) in super::MIGRATIONS {
+            for (index, line) in sql.lines().enumerate() {
+                let normalized = line.trim().to_ascii_lowercase();
+                let words: Vec<&str> = normalized
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .filter(|word| !word.is_empty())
+                    .collect();
+                if words.len() < 2 || words[0] != "alter" || words[1] != "role" {
+                    continue;
+                }
+                if let Some(attribute) = words.iter().find(|word| RESERVED.contains(word)) {
+                    offenders.push(format!(
+                        "V{version} ({name}) line {}: {attribute}",
+                        index + 1
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these ALTER ROLE statements name an attribute only a superuser may mention; \
+             check pg_roles and refuse instead:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// A role must hold CREATE on `public` at the moment something is given to
+    /// it.
+    ///
+    /// PostgreSQL checks that on every `ALTER ... OWNER TO`. Through 14 every
+    /// role passed by way of PUBLIC; 15 took CREATE away from PUBLIC, and a
+    /// transfer to a role that was never granted it is refused to anyone but a
+    /// superuser: `permission denied for schema public`. V64 and V71 forgot the
+    /// grant for three roles, which no suite saw on either count -- they migrate
+    /// as a superuser, and the local server most of them ran on was 14.
+    ///
+    /// V59's shape is the one to copy: grant CREATE, transfer, revoke it again.
+    /// This reads each file in statement order and tracks grants and revokes, so
+    /// a transfer after the revoke is caught as well as one with no grant.
+    #[test]
+    fn no_migration_transfers_ownership_to_a_role_without_create_on_the_schema() {
+        assert!(
+            super::MIGRATIONS.len() >= 60,
+            "the MIGRATIONS table came back with {} rows: an empty or truncated \
+             table passes the check below vacuously",
+            super::MIGRATIONS.len()
+        );
+
+        fn roles(list: &str) -> Vec<String> {
+            list.split(',')
+                .map(|role| role.trim().trim_matches('"').to_string())
+                .filter(|role| !role.is_empty())
+                .collect()
+        }
+
+        let mut transfers = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (version, name, sql) in super::MIGRATIONS {
+            let uncommented: String = sql
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut may_create: std::collections::BTreeSet<String> = Default::default();
+            for statement in uncommented.split(';') {
+                let words: Vec<&str> = statement.split_whitespace().collect();
+                let lower = words.join(" ").to_ascii_lowercase();
+                if let Some(rest) = lower.strip_prefix("grant create on schema public to ") {
+                    may_create.extend(roles(rest));
+                } else if let Some(rest) =
+                    lower.strip_prefix("revoke create on schema public from ")
+                {
+                    for role in roles(rest) {
+                        may_create.remove(&role);
+                    }
+                } else if let Some(at) = lower.find(" owner to ") {
+                    let role = lower[at + " owner to ".len()..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    transfers += 1;
+                    if role != "current_user" && !may_create.contains(&role) {
+                        offenders.push(format!("V{version} ({name}): OWNER TO {role}"));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            transfers >= 30,
+            "only {transfers} ownership transfers were recognised; the migrations hold more \
+             than thirty, so the statement scan has stopped seeing them"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these transfers hand an object to a role that does not hold CREATE on the \
+             schema at that point, which PostgreSQL 15 and later refuse:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     /// The apply and the record must commit together. Read against the source
     /// rather than a live database because the loop's non-atomic form was
     /// invisible to every test in the suite: both statements succeed, and only
