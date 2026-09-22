@@ -5,6 +5,8 @@
 mod admission;
 #[path = "trace_commons_ingest_internal/public_run.rs"]
 mod public_run;
+#[path = "trace_commons_ingest_internal/rewards.rs"]
+mod rewards;
 #[path = "trace_commons_ingest_internal/token_bundles.rs"]
 mod token_bundles;
 
@@ -164,6 +166,7 @@ use trace_commons_server::trace_corpus_storage::{
     TraceExportManifestRecord as StorageTraceExportManifestRecord,
     TraceExportManifestWrite as StorageTraceExportManifestWrite,
     TraceGateChunkVectorEntryRow as StorageTraceGateChunkVectorEntryRow,
+    TraceGateCreditDecisionRow as StorageTraceGateCreditDecisionRow,
     TraceGateDecisionRow as StorageTraceGateDecisionRow,
     TraceNearCreditOutboxItemRecord as StorageTraceNearCreditOutboxItemRecord,
     TraceNearCreditOutboxItemWrite as StorageTraceNearCreditOutboxItemWrite,
@@ -7474,6 +7477,7 @@ fn community_routes() -> Router<Arc<AppState>> {
 /// response. `from_fn_with_state` binds the shared `AppState` the middleware needs
 /// to resolve + rotate.
 fn authenticated_account_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
+    let reward_routes = rewards::account_routes(state.clone());
     Router::new()
         .route("/v1/account/traces", get(account_traces_list_handler))
         .route(
@@ -7563,6 +7567,7 @@ fn authenticated_account_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             state,
             account_auth_middleware,
         ))
+        .merge(reward_routes)
 }
 
 fn community_cors_layer() -> CorsLayer {
@@ -7595,6 +7600,12 @@ fn community_cors_origins() -> Vec<HeaderValue> {
 
 fn app(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/v1/reward-offers/{program_id}", get(rewards::offer))
+        .route("/v1/missions", get(rewards::mission_catalog))
+        .route(
+            "/v1/missions/{mission_id}",
+            get(rewards::mission_publication),
+        )
         .route("/v1/token-bundles/query", post(token_bundles::query))
         .route(
             "/v1/research/token-bundles/query",
@@ -7968,6 +7979,7 @@ fn app(state: Arc<AppState>) -> Router {
             post(score_credit_quality_handler),
         )
         .route("/v1/admin/recluster-dedup", post(recluster_dedup_handler))
+        .route("/v1/admin/rederive-dedup", post(rederive_dedup_handler))
         .route(
             "/v1/admin/pii-backstop-requeue-quarantined",
             post(pii_backstop_requeue_quarantined_handler),
@@ -13290,9 +13302,13 @@ async fn submit_trace_handler(
                 "admission_identity_conflict",
             ));
         }
+        let gate_decision = gate_credit_decision_for_record(state.as_ref(), &existing)
+            .await
+            .map_err(internal_error)?;
         return Ok(Json(receipt_from_record(
             &existing,
             state.near_settlement_mode,
+            gate_decision.as_ref(),
         )));
     }
     let result = async {
@@ -13316,7 +13332,14 @@ async fn submit_trace_handler(
             if principal_can_remediate_quarantined(tenant.auth(), &existing) {
                 Some(existing)
             } else {
-                let receipt = receipt_from_record(&existing, state.near_settlement_mode);
+                let gate_decision = gate_credit_decision_for_record(state.as_ref(), &existing)
+                    .await
+                    .map_err(internal_error)?;
+                let receipt = receipt_from_record(
+                    &existing,
+                    state.near_settlement_mode,
+                    gate_decision.as_ref(),
+                );
                 append_audit_event(
                     &state.root,
                     tenant.tenant_id(),
@@ -13562,9 +13585,13 @@ async fn submit_trace_handler(
             }
         }
 
+        // The record has only just landed (or been re-scrubbed from
+        // quarantine): the gate has not seen it, so there is no decision to
+        // look up and the receipt carries the labelled estimate.
         Ok(Json(receipt_from_record(
             &record,
             state.near_settlement_mode,
+            None,
         )))
     }
     .await;
@@ -14870,6 +14897,15 @@ async fn submission_status_handler(
     )
     .await
     .map_err(internal_error)?;
+    // One batched lookup over the visible records that were asked about,
+    // not one per status row: the request may carry 500 ids.
+    let asked_records = body
+        .submission_ids
+        .iter()
+        .filter_map(|submission_id| visible_by_submission.get(submission_id).copied());
+    let gate_decisions = gate_credit_decisions_for_records(state.as_ref(), asked_records)
+        .await
+        .map_err(internal_error)?;
     let mut statuses = Vec::new();
     for submission_id in body.submission_ids {
         if let Some(record) = visible_by_submission.get(&submission_id) {
@@ -14877,6 +14913,7 @@ async fn submission_status_handler(
                 record,
                 &status_credit_events,
                 state.near_settlement_mode,
+                gate_decisions.get(&submission_id),
             ));
         }
     }
@@ -38755,7 +38792,17 @@ async fn apply_review_decision(
             .map_err(internal_error)?;
     }
 
-    Ok(receipt_from_record(&record, state.near_settlement_mode))
+    // A decision can already exist here (a re-review of an accepted record),
+    // and the reviewer's receipt must say the same thing the contributor's
+    // next status poll will.
+    let gate_decision = gate_credit_decision_for_record(state, &record)
+        .await
+        .map_err(internal_error)?;
+    Ok(receipt_from_record(
+        &record,
+        state.near_settlement_mode,
+        gate_decision.as_ref(),
+    ))
 }
 
 fn ensure_review_decision_eligible(
@@ -43109,10 +43156,12 @@ async fn run_canary_read_drill(
                 &credit_view.records,
             )
             .await?;
+            let gate_decision = gate_credit_decision_for_record(state, status_record).await?;
             let status = submission_status_from_record(
                 status_record,
                 &status_credit_events,
                 state.near_settlement_mode,
+                gate_decision.as_ref(),
             );
             submit_status_visible = status.submission_id == request.submission_id
                 && status.status == record.status.as_str();
@@ -51126,11 +51175,20 @@ async fn evaluate_and_record_gate(
     // same number today, but the batch re-score route overwrites that column
     // in place; the composite recorded here is the value production used, and
     // only a value production used can be joined to an outcome.
+    // One instant for both the row and its calibration: the batch re-score
+    // selects constants by `decided_at`, so the inline score must select by
+    // the same value or the two would disagree about a row decided on a
+    // calibration boundary.
+    let decided_at = Utc::now();
+    let calibration = trace_commons_server::credit_quality::constants_at(decided_at.timestamp());
     let composite = trace_commons_server::credit_quality::credit_quality(
         i64::try_from(decision.perplexity_micros).unwrap_or(i64::MAX),
         i64::try_from(decision.peak_perplexity_micros).unwrap_or(i64::MAX),
         i64::try_from(decision.novelty_score_micros).unwrap_or(i64::MAX),
-        &trace_commons_server::credit_quality::CREDIT_QUALITY_ACTIVE,
+        calibration,
+    );
+    let author_cols = trace_commons_server::trace_gate_service::author_perplexity_columns(
+        decision.author_perplexity.as_ref(),
     );
     let row = StorageTraceGateDecisionRow {
         decision_id,
@@ -51145,7 +51203,7 @@ async fn evaluate_and_record_gate(
         novelty_passed: decision.novelty_passed,
         embedding_evidence_hash: decision.embedding_evidence_hash.clone(),
         attestation_chain_hash: decision.attestation_chain_hash.clone(),
-        decided_at: Utc::now(),
+        decided_at,
         vector_entry_id: decision.vector_entry_id,
         credit_withheld_reason: None,
         peak_perplexity_micros: Some(
@@ -51165,6 +51223,14 @@ async fn evaluate_and_record_gate(
         qualifying_token_fraction_micros: decision
             .qualifying_token_fraction_micros
             .map(|v| i64::try_from(v).unwrap_or(i64::MAX)),
+        // Per-author perplexity (migration V73). Shadow mode, as above:
+        // recorded here, read by nothing that decides anything. All `None`
+        // when the gate service attributed nothing -- unknown, not zero.
+        agent_prose_perplexity_micros: author_cols[0],
+        agent_prose_tokens: author_cols[1],
+        tool_result_perplexity_micros: author_cols[2],
+        tool_result_tokens: author_cols[3],
+        attributed_token_fraction_micros: author_cols[4],
         // Prospective gate-utility instrumentation (#199).
         composite_score_micros: Some(composite.q_micros),
         // Reported by the index, not derived here: `None` when the configured
@@ -51202,7 +51268,7 @@ async fn evaluate_and_record_gate(
             decision_id,
             cq.q_micros,
             cq.anomaly_ratio_micros,
-            trace_commons_server::credit_quality::CREDIT_QUALITY_ACTIVE.version,
+            calibration.version,
         )
         .await
     {
@@ -51273,11 +51339,13 @@ async fn evaluate_and_record_gate(
             }
         })
         .collect();
+    // The constants belong to the algorithm that derived the value: the
+    // gate service stamped `ACTIVE_DEDUP_ALGORITHM`, so its tau applies.
     let cluster_id = match trace_commons_server::dedup_assign::assign_cluster(
         dedup_simhash as u64,
         &dedup_signal_version,
         &candidates,
-        &trace_commons_server::dedup_assign::DEDUP_CONSTANTS_V1,
+        trace_commons_server::dedup_simhash::ACTIVE_DEDUP_ALGORITHM.constants(),
     ) {
         trace_commons_server::dedup_assign::ClusterAssignment::Existing(id) => id,
         trace_commons_server::dedup_assign::ClusterAssignment::New => uuid::Uuid::new_v4(),
@@ -51365,9 +51433,14 @@ async fn evaluate_and_record_gate(
         //
         // Passing the constant is what the signature requires, not a claim of
         // protection. Closing this needs a `correction_signal_version` column,
-        // which is a migration and belongs with the re-derivation pass, not
-        // here.
-        let correction_version = trace_commons_server::dedup_simhash::DEDUP_SIMHASH_ALGORITHM;
+        // which is a migration and is out of scope for the trace-side
+        // re-derivation pass.
+        //
+        // Pinned to v1 BY NAME, as `correction_simhash_from_plaintext` is:
+        // because nothing here is versioned, the correction path must not
+        // follow `ACTIVE_DEDUP_ALGORITHM` when it moves, or old and new
+        // correction values would fuse under the new label.
+        let correction_version = trace_commons_server::dedup_simhash::DedupAlgorithm::V1.name();
         let correction_candidates: Vec<trace_commons_server::dedup_assign::ClusterCandidate<'_>> =
             correction_reps
                 .iter()
@@ -51385,7 +51458,7 @@ async fn evaluate_and_record_gate(
             correction_simhash as u64,
             correction_version,
             &correction_candidates,
-            &trace_commons_server::dedup_assign::DEDUP_CONSTANTS_V1,
+            trace_commons_server::dedup_simhash::DedupAlgorithm::V1.constants(),
         ) {
             trace_commons_server::dedup_assign::ClusterAssignment::Existing(id) => id,
             trace_commons_server::dedup_assign::ClusterAssignment::New => uuid::Uuid::new_v4(),
@@ -51608,9 +51681,53 @@ async fn requeue_pii_backstop_handler(
 /// (useful for a `?limit=5` pilot smoke before a full pass); absent means the
 /// whole decision backlog.
 #[derive(Debug, Deserialize)]
+// A mistyped `author_only` must be refused, not read as the default: the
+// default is a FULL re-score, which rewrites `perplexity_passed`, and the
+// route acknowledges before it works.
+#[serde(deny_unknown_fields)]
 struct RescorePerplexityQuery {
     #[serde(default)]
     limit: Option<i64>,
+    /// Backfill the per-author perplexity columns (migration V73) only;
+    /// never touch whole-trace perplexity or `perplexity_passed`. This is the
+    /// mode to use on rows gated under a scorer model that has since changed:
+    /// a full re-score would re-derive `perplexity_passed` under the new
+    /// model and silently rewrite gating history. Absent means `false`,
+    /// which is the route's behavior before this parameter existed.
+    #[serde(default)]
+    author_only: bool,
+    /// Calibration mode: score every decided submission exactly as a
+    /// re-score would, write NOTHING, and log aggregate distributions only.
+    /// This is how a floor is recalibrated for a new scorer model without
+    /// rewriting the gating history it is measured against. Wins over
+    /// `author_only`: a dry run writes nothing whatever else was asked for.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// Which columns a re-score pass writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RescoreMode {
+    /// Whole-trace perplexity, the pass flag, and the per-author columns.
+    Full,
+    /// The five per-author columns only; never erases (see
+    /// `RescoreOneOutcome::AuthorUnattributed`).
+    AuthorOnly,
+    /// Nothing. Scores are collected and summarized, never stored.
+    DryRun,
+}
+
+impl RescorePerplexityQuery {
+    fn mode(&self) -> RescoreMode {
+        if self.dry_run {
+            RescoreMode::DryRun
+        } else if self.author_only {
+            RescoreMode::AuthorOnly
+        } else {
+            RescoreMode::Full
+        }
+    }
 }
 
 /// Hash-only acknowledgement for the perplexity re-score admin route. The work
@@ -51619,6 +51736,9 @@ struct RescorePerplexityQuery {
 struct RescorePerplexityAck {
     accepted: bool,
     limit: Option<i64>,
+    /// The mode the pass was started in. The work is fire-and-forget, so
+    /// this is the operator's only confirmation of which columns it writes.
+    mode: RescoreMode,
 }
 
 /// Running tally for one perplexity re-score pass.
@@ -51628,6 +51748,54 @@ struct RescorePerplexitySummary {
     rescored: usize,
     /// Submissions skipped because load/scoring/update failed (left as-is).
     failed: usize,
+    /// Author-only mode: submissions scored successfully for which nothing
+    /// could be attributed, so nothing was written. Not a failure, but not a
+    /// backfill either -- a pass that reports only this has a scorer that
+    /// supplies no usable token lengths.
+    author_unattributed: usize,
+    /// Dry-run mode only: every score the pass computed, held in memory for
+    /// the length of the pass and summarized into aggregates when it ends.
+    /// Never persisted and never logged row by row.
+    dry_run: Option<DryRunScores>,
+}
+
+/// Scores collected by a dry-run pass. Whole-trace vectors have one entry
+/// per scored submission; per-author vectors only where that author had
+/// attributed tokens.
+#[derive(Debug, Default)]
+struct DryRunScores {
+    perplexity_micros: Vec<u64>,
+    peak_perplexity_micros: Vec<u64>,
+    agent_prose_perplexity_micros: Vec<u64>,
+    agent_prose_tokens: Vec<u64>,
+    tool_result_perplexity_micros: Vec<u64>,
+    attributed_token_fraction_micros: Vec<u64>,
+    /// Scored submissions for which nothing could be attributed.
+    author_unattributed: usize,
+}
+
+impl DryRunScores {
+    fn record(
+        &mut self,
+        outcome: &trace_commons_server::trace_gate_service::PerplexityOnlyGateOutcome,
+    ) {
+        self.perplexity_micros.push(outcome.perplexity_micros);
+        self.peak_perplexity_micros
+            .push(outcome.peak_perplexity_micros);
+        let Some(ap) = outcome.author_perplexity.as_ref() else {
+            self.author_unattributed += 1;
+            return;
+        };
+        self.attributed_token_fraction_micros
+            .push(ap.attributed_token_fraction_micros);
+        self.agent_prose_tokens.push(ap.agent_prose_tokens);
+        if let Some(v) = ap.agent_prose_perplexity_micros {
+            self.agent_prose_perplexity_micros.push(v);
+        }
+        if let Some(v) = ap.tool_result_perplexity_micros {
+            self.tool_result_perplexity_micros.push(v);
+        }
+    }
 }
 
 /// Re-score the perplexity of ONE already-decided submission and update only
@@ -51637,7 +51805,78 @@ struct RescorePerplexitySummary {
 /// query, no vector-index insert), then updates only `perplexity_micros`,
 /// `peak_perplexity_micros`, and `perplexity_passed`. Novelty, tail-fraction,
 /// vector-entry, gate status, and credit are never touched.
-async fn rescore_perplexity_one(state: &AppState, item: &GateWorkItem) -> anyhow::Result<()> {
+/// Candidate whole-trace floors a dry run reports the would-refuse share for,
+/// ascending. They bracket the 6.0 floor calibrated for the previous scorer
+/// model; the point of a dry run is to see where a new model's traces fall
+/// against them.
+const DRY_RUN_CANDIDATE_FLOORS_MICROS: [u64; 8] = [
+    1_500_000, 2_000_000, 2_500_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000, 8_000_000,
+];
+
+/// Below this many agent-prose tokens a per-author perplexity is too noisy
+/// to gate on; the report counts such rows so calibration can see how many
+/// traces a prose-based floor could not judge.
+const THIN_AGENT_PROSE_TOKENS: u64 = 200;
+
+/// Everything a dry run logs: aggregates only. Every summary withholds its
+/// percentiles below `rescore_distribution::MIN_ROWS_FOR_PERCENTILES`, and
+/// the floor shares are empty below it, so a small pass reports counts and
+/// nothing a row could be read out of.
+#[derive(Debug, Serialize)]
+struct DryRunReport {
+    whole_trace_perplexity: trace_commons_server::rescore_distribution::DistributionSummary,
+    peak_chunk_perplexity: trace_commons_server::rescore_distribution::DistributionSummary,
+    agent_prose_perplexity: trace_commons_server::rescore_distribution::DistributionSummary,
+    agent_prose_tokens: trace_commons_server::rescore_distribution::DistributionSummary,
+    tool_result_perplexity: trace_commons_server::rescore_distribution::DistributionSummary,
+    attributed_token_fraction: trace_commons_server::rescore_distribution::DistributionSummary,
+    /// `(candidate whole-trace floor, share of scored traces strictly below
+    /// it)`, both in micros, ascending by floor.
+    share_below_floor_micros: Vec<(u64, u64)>,
+    /// Attributed rows with fewer than `THIN_AGENT_PROSE_TOKENS` prose tokens.
+    thin_agent_prose_rows: usize,
+    author_unattributed: usize,
+}
+
+fn dry_run_report(scores: &DryRunScores) -> DryRunReport {
+    use trace_commons_server::rescore_distribution::{share_below_micros, summarize};
+    DryRunReport {
+        whole_trace_perplexity: summarize(&scores.perplexity_micros),
+        peak_chunk_perplexity: summarize(&scores.peak_perplexity_micros),
+        agent_prose_perplexity: summarize(&scores.agent_prose_perplexity_micros),
+        agent_prose_tokens: summarize(&scores.agent_prose_tokens),
+        tool_result_perplexity: summarize(&scores.tool_result_perplexity_micros),
+        attributed_token_fraction: summarize(&scores.attributed_token_fraction_micros),
+        share_below_floor_micros: DRY_RUN_CANDIDATE_FLOORS_MICROS
+            .iter()
+            .filter_map(|floor| {
+                share_below_micros(&scores.perplexity_micros, *floor).map(|s| (*floor, s))
+            })
+            .collect(),
+        thin_agent_prose_rows: scores
+            .agent_prose_tokens
+            .iter()
+            .filter(|t| **t < THIN_AGENT_PROSE_TOKENS)
+            .count(),
+        author_unattributed: scores.author_unattributed,
+    }
+}
+
+/// What one re-score wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RescoreOneOutcome {
+    Updated,
+    /// Dry-run mode: scored, nothing written.
+    DryRunScored(trace_commons_server::trace_gate_service::PerplexityOnlyGateOutcome),
+    /// Author-only mode, and the scorer attributed nothing: nothing written.
+    AuthorUnattributed,
+}
+
+async fn rescore_perplexity_one(
+    state: &AppState,
+    item: &GateWorkItem,
+    mode: RescoreMode,
+) -> anyhow::Result<RescoreOneOutcome> {
     let db = state
         .db_mirror
         .as_ref()
@@ -51653,24 +51892,55 @@ async fn rescore_perplexity_one(state: &AppState, item: &GateWorkItem) -> anyhow
         &wrapped_dek,
         TraceArtifactKind::ContributionEnvelope,
     )?;
+    if mode == RescoreMode::DryRun {
+        // Before any storage call, so "writes nothing" is structural: a dry
+        // run never reaches code that can update a row.
+        return Ok(RescoreOneOutcome::DryRunScored(outcome));
+    }
+    let author_only = mode == RescoreMode::AuthorOnly;
     let perplexity_micros = i64::try_from(outcome.perplexity_micros).unwrap_or(i64::MAX);
     let peak_perplexity_micros =
         Some(i64::try_from(outcome.peak_perplexity_micros).unwrap_or(i64::MAX));
-    db.update_trace_gate_decision_perplexity(
+    let author_cols = trace_commons_server::trace_gate_service::author_perplexity_columns(
+        outcome.author_perplexity.as_ref(),
+    );
+    // A backfill can only add. In author-only mode a scorer that attributes
+    // nothing (no token lengths, or lengths that never tile) must not erase
+    // values an earlier pass computed; the pass counts it instead, so a
+    // backlog-wide "nothing attributed" is visible rather than reported as
+    // success.
+    if author_only && outcome.author_perplexity.is_none() {
+        return Ok(RescoreOneOutcome::AuthorUnattributed);
+    }
+    if !author_only {
+        db.update_trace_gate_decision_perplexity(
+            &item.tenant_id,
+            item.submission_id,
+            perplexity_micros,
+            peak_perplexity_micros,
+            outcome.perplexity_passed,
+        )
+        .await?;
+    }
+    // Both modes write the per-author columns: a full re-score is a superset
+    // of the author-only backfill. In full mode an absent value is written
+    // as NULL on purpose: the row's perplexity was just rewritten under the
+    // current scorer, so per-author values from an older scoring no longer
+    // describe the row and must not be left to disagree with it.
+    db.update_trace_gate_decision_author_perplexity(
         &item.tenant_id,
         item.submission_id,
-        perplexity_micros,
-        peak_perplexity_micros,
-        outcome.perplexity_passed,
+        author_cols,
     )
     .await?;
     // Hash-only: identify the submission by hash, never the perplexity value.
     tracing::info!(
         tenant_hash = %sha256_prefixed(&item.tenant_id),
         submission_hash = %sha256_prefixed(&item.submission_id.to_string()),
+        author_only,
         "perplexity re-score updated one submission"
     );
-    Ok(())
+    Ok(RescoreOneOutcome::Updated)
 }
 
 /// One perplexity re-score pass. Enumerates submissions that already have a gate
@@ -51682,6 +51952,7 @@ async fn rescore_perplexity_one(state: &AppState, item: &GateWorkItem) -> anyhow
 async fn run_rescore_perplexity_pass(
     state: Arc<AppState>,
     limit: Option<i64>,
+    mode: RescoreMode,
 ) -> anyhow::Result<RescorePerplexitySummary> {
     let db = state
         .db_mirror
@@ -51692,9 +51963,17 @@ async fn run_rescore_perplexity_pass(
         .list_submissions_with_gate_decision(effective_limit)
         .await?;
     let mut summary = RescorePerplexitySummary::default();
+    if mode == RescoreMode::DryRun {
+        summary.dry_run = Some(DryRunScores::default());
+    }
     for item in &items {
-        match rescore_perplexity_one(state.as_ref(), item).await {
-            Ok(()) => summary.rescored += 1,
+        match rescore_perplexity_one(state.as_ref(), item, mode).await {
+            Ok(RescoreOneOutcome::Updated) => summary.rescored += 1,
+            Ok(RescoreOneOutcome::AuthorUnattributed) => summary.author_unattributed += 1,
+            Ok(RescoreOneOutcome::DryRunScored(outcome)) => summary
+                .dry_run
+                .get_or_insert_with(DryRunScores::default)
+                .record(&outcome),
             Err(error) => {
                 summary.failed += 1;
                 tracing::warn!(
@@ -51739,13 +52018,25 @@ async fn rescore_perplexity_handler(
         ));
     }
     let limit = query.limit;
+    let mode = query.mode();
     let task_state = state.clone();
     tokio::spawn(async move {
-        match run_rescore_perplexity_pass(task_state, limit).await {
+        match run_rescore_perplexity_pass(task_state, limit, mode).await {
             Ok(summary) => {
                 tracing::info!(
                     rescored = summary.rescored,
                     failed = summary.failed,
+                    author_unattributed = summary.author_unattributed,
+                    // Aggregates only, and none at all for a small pass; see
+                    // `DryRunReport`. Empty outside dry-run mode.
+                    dry_run_report = %summary
+                        .dry_run
+                        .as_ref()
+                        .map(|scores| {
+                            serde_json::to_string(&dry_run_report(scores))
+                                .unwrap_or_else(|_| "unserializable".to_string())
+                        })
+                        .unwrap_or_default(),
                     "Trace Commons perplexity re-score pass completed"
                 );
             }
@@ -51760,6 +52051,7 @@ async fn rescore_perplexity_handler(
     Ok(Json(RescorePerplexityAck {
         accepted: true,
         limit,
+        mode,
     }))
 }
 
@@ -51801,18 +52093,23 @@ async fn score_credit_quality_one(
         .db_mirror
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("credit-quality scoring requires a configured DB mirror"))?;
+    // The calibration in force when this row was decided, not the newest:
+    // this pass recomputes every row, and a row scored under an earlier
+    // scorer model must not be re-scored against a later model's constants.
+    let calibration =
+        trace_commons_server::credit_quality::constants_at(input.decided_at.timestamp());
     let cq = trace_commons_server::credit_quality::credit_quality(
         input.perplexity_micros,
         input.peak_perplexity_micros,
         input.novelty_score_micros,
-        &trace_commons_server::credit_quality::CREDIT_QUALITY_ACTIVE,
+        calibration,
     );
     db.update_trace_gate_decision_credit_quality(
         &input.tenant_id,
         input.decision_id,
         cq.q_micros,
         cq.anomaly_ratio_micros,
-        trace_commons_server::credit_quality::CREDIT_QUALITY_ACTIVE.version,
+        calibration.version,
     )
     .await?;
     // Hash-only: identify the decision by hash, never the perplexity/novelty
@@ -51938,12 +52235,12 @@ struct ReclusterDedupSummary {
 ///
 /// Enumerates dedup signal rows cross-tenant (`decided_at ASC`, per
 /// `list_dedup_signals`), then recomputes cluster assignments over that whole
-/// snapshot in a SINGLE deterministic sweep: walking rows in order, each row
-/// with a recorded simhash is assigned against the clusters formed so far
-/// (via `assign_cluster`, simhash-only candidates — `embed_cosine_micros:
-/// None`), joining an existing cluster or minting a new one. Rows without a
-/// recorded simhash cannot be clustered and are left untouched (not counted,
-/// not written).
+/// snapshot in a SINGLE deterministic sweep (`dedup_assign::sweep_clusters`,
+/// the same function the re-derivation pass uses, so the two cannot disagree
+/// on membership): walking rows in order, each row with a recorded simhash is
+/// assigned against the clusters formed so far, joining an existing cluster
+/// or minting a new one. Rows without a recorded simhash cannot be clustered
+/// and are left untouched (not counted, not written).
 ///
 /// Candidates are scoped to the row's own `dedup_signal_version` (V57) by
 /// `assign_cluster` itself: the pass reads stored simhashes and never
@@ -51969,77 +52266,37 @@ async fn run_recluster_dedup_pass(
     let effective_limit = limit.unwrap_or(i64::MAX).max(0);
     let rows = db.list_dedup_signals(effective_limit).await?;
 
-    // Pass 1: single deterministic sweep building cluster assignments over
-    // the snapshot. `reps` holds each cluster's representative simhash AND
-    // the signal version it was derived under (both taken from the row that
-    // created the cluster); `counts` holds each cluster's running (and, after
-    // the loop, final) membership.
-    let mut reps: std::collections::HashMap<uuid::Uuid, (u64, &str)> =
-        std::collections::HashMap::new();
-    let mut counts: std::collections::HashMap<uuid::Uuid, i64> = std::collections::HashMap::new();
-    /// One row the sweep placed, carrying what pass 2 needs to write it --
-    /// which is the cluster and nothing else. The simhash and the stamp are
-    /// deliberately absent: the pass read them, it did not derive them, so it
-    /// has nothing to say about them.
-    struct AssignedRow<'a> {
-        row: &'a trace_commons_server::trace_corpus_storage::DedupSignalRow,
-        cluster_id: uuid::Uuid,
-    }
-    let mut assigned: Vec<AssignedRow<'_>> = Vec::new();
-
-    for row in &rows {
-        let Some(simhash_i64) = row.dedup_simhash else {
-            // No simhash recorded yet: cannot cluster this row. Skip it —
-            // leave it as-is, do not write it.
-            continue;
-        };
-        let simhash_u64 = simhash_i64 as u64;
-        // NULL reads as the legacy v1 stamp, never as unknown (V57, D2), so a
-        // pre-V57 row and a freshly stamped v1 row still cluster together.
-        // Borrowed from `rows`, which outlives every map built from it.
-        let row_version = row.effective_signal_version();
-        // No version filter here: `assign_cluster` refuses a differently
-        // stamped candidate itself. That gate is what keeps the transition
-        // window honest — the pass reads stored simhashes and never
-        // re-renders, so without it a corpus holding both versions would fuse
-        // them silently.
-        let candidates: Vec<trace_commons_server::dedup_assign::ClusterCandidate<'_>> = reps
-            .iter()
-            .map(|(cluster_id, (simhash, version))| {
-                trace_commons_server::dedup_assign::ClusterCandidate {
-                    cluster_id: *cluster_id,
-                    size: *counts.get(cluster_id).unwrap_or(&0),
-                    simhash: *simhash,
-                    embed_cosine_micros: None,
-                    signal_version: version,
-                }
-            })
-            .collect();
-        let cluster_id = match trace_commons_server::dedup_assign::assign_cluster(
-            simhash_u64,
-            row_version,
-            &candidates,
-            &trace_commons_server::dedup_assign::DEDUP_CONSTANTS_V1,
-        ) {
-            trace_commons_server::dedup_assign::ClusterAssignment::Existing(id) => id,
-            trace_commons_server::dedup_assign::ClusterAssignment::New => {
-                let id = uuid::Uuid::new_v4();
-                reps.insert(id, (simhash_u64, row_version));
-                id
-            }
-        };
-        *counts.entry(cluster_id).or_insert(0) += 1;
-        assigned.push(AssignedRow { row, cluster_id });
-    }
+    // Pass 1: the sweep, over every row with a recorded simhash. Each row's
+    // stored cluster id is offered as its preferred id so a converged corpus
+    // re-sweeps to itself.
+    let clusterable: Vec<&trace_commons_server::trace_corpus_storage::DedupSignalRow> = rows
+        .iter()
+        .filter(|row| row.dedup_simhash.is_some())
+        .collect();
+    let sweep_rows: Vec<trace_commons_server::dedup_assign::SweepRow<'_>> = clusterable
+        .iter()
+        .map(|row| trace_commons_server::dedup_assign::SweepRow {
+            simhash: row.dedup_simhash.unwrap_or_default() as u64,
+            // NULL reads as the legacy v1 stamp, never as unknown (V57, D2),
+            // so a pre-V57 row and a freshly stamped v1 row still cluster
+            // together.
+            signal_version: row.effective_signal_version(),
+            stored_cluster_id: row.dedup_cluster_id,
+        })
+        .collect();
+    // The inline path's constants: this route re-sweeps what the inline
+    // path wrote, under the stamps it wrote, so it clusters the same way.
+    let sweep = trace_commons_server::dedup_assign::sweep_clusters(
+        &sweep_rows,
+        trace_commons_server::dedup_simhash::ACTIVE_DEDUP_ALGORITHM.constants(),
+    );
 
     // Pass 2: write every assigned row with its cluster's FINAL total
     // membership count (computed after the whole sweep above).
     let mut summary = ReclusterDedupSummary::default();
-    for assignment in assigned {
-        let row = assignment.row;
+    for (row, assignment) in clusterable.iter().zip(&sweep.assignments) {
         let cluster_id = assignment.cluster_id;
-        let final_size =
-            i32::try_from(counts.get(&cluster_id).copied().unwrap_or(1)).unwrap_or(i32::MAX);
+        let final_size = i32::try_from(sweep.size_of(cluster_id).max(1)).unwrap_or(i32::MAX);
         // Cluster columns only. The pass derives neither the simhash nor the
         // stamp, so it writes neither -- and in particular it does not
         // materialise the legacy literal into a row whose stamp is NULL.
@@ -52331,6 +52588,636 @@ async fn recluster_dedup_handler(
     Ok(Json(ReclusterDedupAck {
         accepted: true,
         limit,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Dedup re-derivation pass (`POST /v1/admin/rederive-dedup`)
+// ---------------------------------------------------------------------------
+
+/// Query params for the dedup re-derivation admin route. `algorithm` is
+/// required and closed (an unknown name is a 400, never a default); `limit`
+/// bounds the enumeration for a `?limit=5` smoke; `dry_run` derives and
+/// sweeps, writes nothing and logs aggregates.
+#[derive(Debug, Deserialize)]
+// A mistyped `dry_run` must be refused, not read as the default: the default
+// is WRITE mode, which re-stamps every derivable row, and the route
+// acknowledges before it works.
+#[serde(deny_unknown_fields)]
+struct RederiveDedupQuery {
+    algorithm: trace_commons_server::dedup_simhash::DedupAlgorithm,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// Whether a re-derivation pass writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RederiveDedupMode {
+    /// Derive, sweep, log the report, store nothing.
+    DryRun,
+    /// Derive, sweep, and write every row whose four dedup columns changed.
+    Write,
+}
+
+impl RederiveDedupQuery {
+    fn mode(&self) -> RederiveDedupMode {
+        if self.dry_run {
+            RederiveDedupMode::DryRun
+        } else {
+            RederiveDedupMode::Write
+        }
+    }
+}
+
+/// Hash-only acknowledgement for the re-derivation route. The work runs in
+/// a spawned background task; this is the operator's only confirmation of
+/// which mode and which algorithm were started.
+#[derive(Debug, Serialize)]
+struct RederiveDedupAck {
+    accepted: bool,
+    limit: Option<i64>,
+    mode: RederiveDedupMode,
+    algorithm: trace_commons_server::dedup_simhash::DedupAlgorithm,
+}
+
+/// Per-row outcome counts for one pass, shared by the summary and the
+/// dry-run report.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+struct RederiveDedupCounts {
+    /// Decision rows enumerated.
+    rows: usize,
+    /// Rows whose envelope was loaded, decrypted, rendered and hashed.
+    derived: usize,
+    /// Rows already on the target stamp with a stored value: no load.
+    reused: usize,
+    /// Rows whose stored stamp is not a simhash of any text
+    /// (`digest-prefix.v1`, the placeholder): skipped, never written.
+    not_derivable: usize,
+    /// Rows whose load or derivation failed: kept on their old stamp and
+    /// value, so still refused against every re-derived row until a rerun
+    /// succeeds on them.
+    failed: usize,
+}
+
+/// Running tally for one re-derivation pass.
+#[derive(Debug, Default)]
+struct RederiveDedupSummary {
+    rows: usize,
+    derived: usize,
+    reused: usize,
+    not_derivable: usize,
+    failed: usize,
+    /// Write mode: rows whose four columns differed and were updated.
+    written: usize,
+    /// Write mode: rows whose four columns already matched; not written. A
+    /// rerun over a converged corpus reads `unchanged = rows`.
+    unchanged: usize,
+    /// Write mode: rows whose update failed (left as-is).
+    write_failed: usize,
+    /// Dry-run mode only.
+    dry_run: Option<RederiveDedupDryRunReport>,
+}
+
+/// One row as the sweep sees it, with the tenant kept for the report's
+/// same-tenant / cross-tenant cluster counts. Never logged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RederiveSweepInput {
+    tenant_id: String,
+    simhash: u64,
+    signal_version: String,
+    stored_cluster_id: Option<uuid::Uuid>,
+}
+
+impl RederiveSweepInput {
+    fn sweep_row(&self) -> trace_commons_server::dedup_assign::SweepRow<'_> {
+        trace_commons_server::dedup_assign::SweepRow {
+            simhash: self.simhash,
+            signal_version: &self.signal_version,
+            stored_cluster_id: self.stored_cluster_id,
+        }
+    }
+}
+
+/// Buckets for the nearest-representative Hamming histogram: `(label,
+/// lowest, highest)`, inclusive. The spec's twelve, plus `33-64` so a
+/// distance above 32 (where two unrelated 64-bit signatures sit, about
+/// 32 +/- 4) is counted rather than dropped.
+const HAMMING_HISTOGRAM_BUCKETS: [(&str, u32, u32); 13] = [
+    ("0", 0, 0),
+    ("1-2", 1, 2),
+    ("3-4", 3, 4),
+    ("5-6", 5, 6),
+    ("7-8", 7, 8),
+    ("9-10", 9, 10),
+    ("11-12", 11, 12),
+    ("13-14", 13, 14),
+    ("15-16", 15, 16),
+    ("17-20", 17, 20),
+    ("21-24", 21, 24),
+    ("25-32", 25, 32),
+    ("33-64", 33, 64),
+];
+
+/// The would-be cluster-size distribution at one candidate `tau_hamming`,
+/// over the target-stamped rows: the shape of the table the pilot was
+/// measured with, so before and after read the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ClusterSizeDistribution {
+    tau_hamming: u32,
+    clusters: usize,
+    singletons: usize,
+    size_2_to_9: usize,
+    size_10_to_99: usize,
+    size_100_plus: usize,
+    largest_cluster_size: i64,
+    /// Share of target rows in the largest cluster, in micros.
+    largest_cluster_share_micros: u64,
+}
+
+/// Everything a dry run logs: aggregates only. Below
+/// `rescore_distribution::MIN_ROWS_FOR_PERCENTILES` target rows the shape is
+/// withheld -- histogram and per-tau tables empty, tenant-span counts `None`
+/// -- and the report carries counts only, so a `limit=5` smoke reports the
+/// mechanism and nothing a row could be read out of. No simhash value, no
+/// id and no tenant appears in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RederiveDedupDryRunReport {
+    algorithm: trace_commons_server::dedup_simhash::DedupAlgorithm,
+    target_signal_version: String,
+    rows: usize,
+    derived: usize,
+    reused: usize,
+    not_derivable: usize,
+    failed: usize,
+    /// Rows on the target stamp after derivation; the distributions below
+    /// describe these.
+    target_rows: usize,
+    distinct_target_simhashes: usize,
+    /// `(bucket label, rows)` for each row's Hamming distance to its nearest
+    /// same-stamped cluster representative, at the algorithm's own tau,
+    /// every bucket present in order.
+    nearest_representative_hamming: Vec<(String, usize)>,
+    /// One entry per `DRY_RUN_CANDIDATE_TAU_HAMMING`, ascending.
+    by_candidate_tau: Vec<ClusterSizeDistribution>,
+    /// At the algorithm's own tau: multi-member clusters whose members all
+    /// share one `tenant_id` (on the pilot, one contributor resubmitting or
+    /// forking), and clusters spanning two or more (the sybil case or a
+    /// shared session). Counts only.
+    single_tenant_multi_member_clusters: Option<usize>,
+    multi_tenant_multi_member_clusters: Option<usize>,
+}
+
+fn cluster_size_distribution(
+    tau_hamming: u32,
+    sizes: &[i64],
+    target_rows: usize,
+) -> ClusterSizeDistribution {
+    let largest = sizes.iter().copied().max().unwrap_or(0);
+    ClusterSizeDistribution {
+        tau_hamming,
+        clusters: sizes.len(),
+        singletons: sizes.iter().filter(|s| **s == 1).count(),
+        size_2_to_9: sizes.iter().filter(|s| (2..=9).contains(*s)).count(),
+        size_10_to_99: sizes.iter().filter(|s| (10..=99).contains(*s)).count(),
+        size_100_plus: sizes.iter().filter(|s| **s >= 100).count(),
+        largest_cluster_size: largest,
+        largest_cluster_share_micros: if target_rows == 0 {
+            0
+        } else {
+            (largest.max(0) as u64 * 1_000_000) / target_rows as u64
+        },
+    }
+}
+
+/// Build the dry-run report from the sweep inputs. Pure, so its shape is
+/// unit-tested without a store; the pass calls it once at the end.
+fn rederive_dedup_dry_run_report(
+    inputs: &[RederiveSweepInput],
+    algorithm: trace_commons_server::dedup_simhash::DedupAlgorithm,
+    counts: &RederiveDedupCounts,
+) -> RederiveDedupDryRunReport {
+    use std::collections::{HashMap, HashSet};
+    use trace_commons_server::dedup_assign::{
+        DRY_RUN_CANDIDATE_TAU_HAMMING, DedupConstants, sweep_clusters,
+    };
+    use trace_commons_server::rescore_distribution::MIN_ROWS_FOR_PERCENTILES;
+
+    let target = trace_commons_server::trace_gate_service::dedup_signal_version_for(algorithm);
+    let is_target: Vec<bool> = inputs.iter().map(|i| i.signal_version == target).collect();
+    let target_rows = is_target.iter().filter(|t| **t).count();
+    let distinct_target_simhashes = inputs
+        .iter()
+        .zip(&is_target)
+        .filter(|(_, t)| **t)
+        .map(|(i, _)| i.simhash)
+        .collect::<HashSet<u64>>()
+        .len();
+    let mut report = RederiveDedupDryRunReport {
+        algorithm,
+        target_signal_version: target,
+        rows: counts.rows,
+        derived: counts.derived,
+        reused: counts.reused,
+        not_derivable: counts.not_derivable,
+        failed: counts.failed,
+        target_rows,
+        distinct_target_simhashes,
+        nearest_representative_hamming: Vec::new(),
+        by_candidate_tau: Vec::new(),
+        single_tenant_multi_member_clusters: None,
+        multi_tenant_multi_member_clusters: None,
+    };
+    if target_rows < MIN_ROWS_FOR_PERCENTILES {
+        return report;
+    }
+
+    let rows: Vec<trace_commons_server::dedup_assign::SweepRow<'_>> =
+        inputs.iter().map(RederiveSweepInput::sweep_row).collect();
+    // Sizes of the clusters target rows land in, for one sweep result.
+    let target_cluster_sizes = |sweep: &trace_commons_server::dedup_assign::SweepResult| {
+        let mut sizes: HashMap<uuid::Uuid, i64> = HashMap::new();
+        for (a, t) in sweep.assignments.iter().zip(&is_target) {
+            if *t {
+                *sizes.entry(a.cluster_id).or_insert(0) += 1;
+            }
+        }
+        sizes
+    };
+
+    let own = algorithm.constants();
+    let at_own_tau = sweep_clusters(&rows, own);
+    report.nearest_representative_hamming = HAMMING_HISTOGRAM_BUCKETS
+        .iter()
+        .map(|(label, lo, hi)| {
+            let n = at_own_tau
+                .assignments
+                .iter()
+                .zip(&is_target)
+                .filter(|(_, t)| **t)
+                .filter_map(|(a, _)| a.nearest_representative_hamming)
+                .filter(|d| (*lo..=*hi).contains(d))
+                .count();
+            (label.to_string(), n)
+        })
+        .collect();
+    let mut tenants_by_cluster: HashMap<uuid::Uuid, HashSet<&str>> = HashMap::new();
+    for ((a, t), input) in at_own_tau.assignments.iter().zip(&is_target).zip(inputs) {
+        if *t {
+            tenants_by_cluster
+                .entry(a.cluster_id)
+                .or_default()
+                .insert(input.tenant_id.as_str());
+        }
+    }
+    let own_sizes = target_cluster_sizes(&at_own_tau);
+    let multi_member = own_sizes.iter().filter(|(_, size)| **size >= 2);
+    let (mut single_tenant, mut multi_tenant) = (0usize, 0usize);
+    for (cluster_id, _) in multi_member {
+        match tenants_by_cluster.get(cluster_id).map(HashSet::len) {
+            Some(n) if n >= 2 => multi_tenant += 1,
+            _ => single_tenant += 1,
+        }
+    }
+    report.single_tenant_multi_member_clusters = Some(single_tenant);
+    report.multi_tenant_multi_member_clusters = Some(multi_tenant);
+
+    report.by_candidate_tau = DRY_RUN_CANDIDATE_TAU_HAMMING
+        .iter()
+        .map(|tau| {
+            let k = DedupConstants {
+                tau_hamming: *tau,
+                ..*own
+            };
+            let sizes: Vec<i64> = target_cluster_sizes(&sweep_clusters(&rows, &k))
+                .into_values()
+                .collect();
+            cluster_size_distribution(*tau, &sizes, target_rows)
+        })
+        .collect();
+    report
+}
+
+/// What the pass established about one enumerated row before the sweep.
+enum RederiveRowOutcome {
+    /// A `(simhash, stamp)` the sweep can place, and whether it came from
+    /// a derivation or from the stored columns.
+    Signal {
+        simhash: u64,
+        signal_version: String,
+        derived: bool,
+    },
+    /// Stored stamp names no text derivation; the row is swept under its
+    /// own stamp if it has a value, and never written.
+    NotDerivable,
+    /// Load or derivation failed; the row is swept under its stored stamp
+    /// and value if it has one, and never written by this pass.
+    Failed(anyhow::Error),
+}
+
+/// Establish one row's `(simhash, stamp)` for the target algorithm.
+async fn rederive_dedup_row(
+    state: &AppState,
+    row: &trace_commons_server::trace_corpus_storage::DedupRederiveRow,
+    algorithm: trace_commons_server::dedup_simhash::DedupAlgorithm,
+    target: &str,
+) -> RederiveRowOutcome {
+    let stored = row.effective_signal_version();
+    // 1. Already on the target stamp with a value: reuse. No load, no
+    //    decrypt. This is what makes a rerun cheap and a crash resumable.
+    if stored == target {
+        if let Some(simhash) = row.dedup_simhash {
+            return RederiveRowOutcome::Signal {
+                simhash: simhash as u64,
+                signal_version: target.to_string(),
+                derived: false,
+            };
+        }
+    }
+    // 2. A digest window or a placeholder is not a simhash of any text and
+    //    cannot be re-derived from one. Such rows come only from development
+    //    and test services.
+    if stored == trace_commons_server::trace_gate_service::DETERMINISTIC_DEDUP_SIGNAL_VERSION
+        || stored == trace_commons_server::dedup_assign::PLACEHOLDER_DEDUP_SIGNAL_VERSION
+    {
+        return RederiveRowOutcome::NotDerivable;
+    }
+    // 3. Load the exact ciphertext the gate scored and derive inside the
+    //    gate service. The plaintext never comes back here.
+    let derived = async {
+        let (ciphertext, wrapped_dek) =
+            load_trace_ciphertext_and_wrapped_dek(state, &row.tenant_id, row.submission_id).await?;
+        // Canonical tenant_storage_ref: the wrapped DEK was produced under
+        // this ref (matches `evaluate_and_record_gate`); anything else fails
+        // KekContextMismatch.
+        let tenant_ctx = GateTenantCtx::from_canonical(tenant_storage_ref(&row.tenant_id));
+        state.gate_service.derive_dedup_signal(
+            &tenant_ctx,
+            &ciphertext,
+            &wrapped_dek,
+            TraceArtifactKind::ContributionEnvelope,
+            algorithm,
+        )
+    }
+    .await;
+    match derived {
+        Ok(signal) => RederiveRowOutcome::Signal {
+            simhash: signal.simhash as u64,
+            signal_version: signal.signal_version,
+            derived: true,
+        },
+        Err(error) => RederiveRowOutcome::Failed(error),
+    }
+}
+
+/// One dedup re-derivation pass. Enumerates every decision row cross-tenant
+/// in `decided_at` order, establishes each row's `(simhash, stamp)` for the
+/// target algorithm (reusing stored target-stamped values, deriving the rest
+/// from the encrypted envelopes, skipping the non-derivable, keeping failed
+/// rows as they are), sweeps everything with `dedup_assign::sweep_clusters`
+/// under the target algorithm's constants, and then either logs the report
+/// (dry run) or writes every row whose four dedup columns changed.
+///
+/// Rows carrying a non-target stamp (skipped or failed) are in the sweep, so
+/// they keep clustering among themselves as today, and the version gate
+/// inside `assign_cluster` keeps them out of the target clusters. Their
+/// cluster columns are refreshed with the sweep's totals when they changed,
+/// through the cluster-only writer, so sizes stay consistent corpus-wide;
+/// their simhash and stamp are never touched by this pass.
+///
+/// Idempotent: two consecutive runs on a quiet corpus produce identical
+/// columns and the second writes nothing.
+async fn run_rederive_dedup_pass(
+    state: Arc<AppState>,
+    limit: Option<i64>,
+    mode: RederiveDedupMode,
+    algorithm: trace_commons_server::dedup_simhash::DedupAlgorithm,
+) -> anyhow::Result<RederiveDedupSummary> {
+    let db = state
+        .db_mirror
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("dedup re-derivation requires a configured DB mirror"))?;
+    let effective_limit = limit.unwrap_or(i64::MAX).max(0);
+    let rows = db.list_dedup_rederive_rows(effective_limit).await?;
+    let target = trace_commons_server::trace_gate_service::dedup_signal_version_for(algorithm);
+
+    let mut counts = RederiveDedupCounts {
+        rows: rows.len(),
+        ..RederiveDedupCounts::default()
+    };
+    // Parallel to `rows`: what the sweep gets for each, or `None` for a row
+    // with nothing to place (never dedup'd and not derivable now).
+    let mut signals: Vec<Option<(RederiveSweepInput, bool)>> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let stored_signal = row.dedup_simhash.map(|simhash| RederiveSweepInput {
+            tenant_id: row.tenant_id.clone(),
+            simhash: simhash as u64,
+            signal_version: row.effective_signal_version().to_string(),
+            stored_cluster_id: row.dedup_cluster_id,
+        });
+        let outcome = rederive_dedup_row(state.as_ref(), row, algorithm, &target).await;
+        signals.push(match outcome {
+            RederiveRowOutcome::Signal {
+                simhash,
+                signal_version,
+                derived,
+            } => {
+                if derived {
+                    counts.derived += 1;
+                } else {
+                    counts.reused += 1;
+                }
+                Some((
+                    RederiveSweepInput {
+                        tenant_id: row.tenant_id.clone(),
+                        simhash,
+                        signal_version,
+                        stored_cluster_id: row.dedup_cluster_id,
+                    },
+                    true,
+                ))
+            }
+            RederiveRowOutcome::NotDerivable => {
+                counts.not_derivable += 1;
+                stored_signal.map(|s| (s, false))
+            }
+            RederiveRowOutcome::Failed(error) => {
+                counts.failed += 1;
+                tracing::warn!(
+                    tenant_hash = %sha256_prefixed(&row.tenant_id),
+                    submission_hash = %sha256_prefixed(&row.submission_id.to_string()),
+                    error_hash = %safe_display_error_hash(&error),
+                    "dedup re-derivation skipped one decision"
+                );
+                stored_signal.map(|s| (s, false))
+            }
+        });
+    }
+
+    let mut summary = RederiveDedupSummary {
+        rows: counts.rows,
+        derived: counts.derived,
+        reused: counts.reused,
+        not_derivable: counts.not_derivable,
+        failed: counts.failed,
+        ..RederiveDedupSummary::default()
+    };
+    let inputs: Vec<RederiveSweepInput> = signals
+        .iter()
+        .flatten()
+        .map(|(input, _)| input.clone())
+        .collect();
+    if mode == RederiveDedupMode::DryRun {
+        // Before any storage call, so "writes nothing" is structural: a dry
+        // run never reaches code that can update a row.
+        summary.dry_run = Some(rederive_dedup_dry_run_report(&inputs, algorithm, &counts));
+        return Ok(summary);
+    }
+
+    let sweep_rows: Vec<trace_commons_server::dedup_assign::SweepRow<'_>> =
+        inputs.iter().map(RederiveSweepInput::sweep_row).collect();
+    let sweep =
+        trace_commons_server::dedup_assign::sweep_clusters(&sweep_rows, algorithm.constants());
+    // Sizes are the sweep's final totals, computed before the first write,
+    // so every member of a cluster is written with the same total.
+    let mut assignments = sweep.assignments.iter();
+    for (row, signal) in rows.iter().zip(&signals) {
+        let Some((input, on_target)) = signal else {
+            continue;
+        };
+        let assignment = assignments
+            .next()
+            .expect("one sweep assignment per placed row");
+        let cluster_id = assignment.cluster_id;
+        let cluster_size = i32::try_from(sweep.size_of(cluster_id).max(1)).unwrap_or(i32::MAX);
+        let unchanged = row.dedup_simhash == Some(input.simhash as i64)
+            && row.effective_signal_version() == input.signal_version
+            && row.dedup_cluster_id == Some(cluster_id)
+            && row.dedup_cluster_size == Some(cluster_size);
+        if unchanged {
+            summary.unchanged += 1;
+            continue;
+        }
+        let written = if *on_target {
+            // All four columns, on the tenant-scoped pool as the inline path
+            // writes them: the stamp lands in the same statement as the
+            // value it names.
+            db.update_trace_gate_decision_dedup(
+                &row.tenant_id,
+                row.decision_id,
+                trace_commons_server::trace_corpus_storage::DedupAssignmentWrite {
+                    dedup_simhash: input.simhash as i64,
+                    dedup_cluster_id: cluster_id,
+                    dedup_cluster_size: cluster_size,
+                    dedup_signal_version: input.signal_version.clone(),
+                },
+            )
+            .await
+        } else {
+            // A row this pass did not derive keeps its simhash and stamp;
+            // only its cluster columns follow the sweep.
+            db.update_trace_gate_decision_dedup_cluster(
+                &row.tenant_id,
+                row.decision_id,
+                cluster_id,
+                cluster_size,
+            )
+            .await
+        };
+        match written {
+            Ok(()) => summary.written += 1,
+            Err(error) => {
+                summary.write_failed += 1;
+                tracing::warn!(
+                    tenant_hash = %sha256_prefixed(&row.tenant_id),
+                    decision_hash = %sha256_prefixed(&row.decision_id.to_string()),
+                    error_hash = %safe_display_error_hash(&error),
+                    "dedup re-derivation failed to write one decision"
+                );
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// Admin route: re-derive the cross-trace dedup signal of every decision
+/// from its encrypted envelope under a named algorithm, re-stamp it,
+/// re-cluster, and write consistent sizes -- or, with `dry_run=true`, do all
+/// of that in memory and log the would-be distribution.
+///
+/// Auth: reuses the admin bearer credential (`require_admin`), matching the
+/// other `/v1/admin/*` maintenance routes; no new gate is introduced. Spawns
+/// a background task and returns a hash-only ack immediately. See
+/// `docs/operator/dedup-recluster.md` for the two-phase rollout this route
+/// is the first half of.
+async fn rederive_dedup_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<RederiveDedupQuery>,
+) -> ApiResult<Json<RederiveDedupAck>> {
+    let tenant = authenticate_with_tenant_access_grant(state.as_ref(), &headers).await?;
+    require_admin(&tenant)?;
+    // Fail-closed preconditions: the pass needs a DB mirror to enumerate and
+    // an artifact store to load ciphertext. The gate service is exercised
+    // per row (one that cannot derive fails each row closed via the
+    // `DedupRederiveUnsupported` bail).
+    if state.db_mirror.is_none() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dedup re-derivation requires a configured DB mirror",
+        ));
+    }
+    if state.artifact_store.is_none() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dedup re-derivation requires a configured artifact store",
+        ));
+    }
+    let limit = query.limit;
+    let mode = query.mode();
+    let algorithm = query.algorithm;
+    let task_state = state.clone();
+    tokio::spawn(async move {
+        match run_rederive_dedup_pass(task_state, limit, mode, algorithm).await {
+            Ok(summary) => {
+                tracing::info!(
+                    rows = summary.rows,
+                    derived = summary.derived,
+                    reused = summary.reused,
+                    not_derivable = summary.not_derivable,
+                    failed = summary.failed,
+                    written = summary.written,
+                    unchanged = summary.unchanged,
+                    write_failed = summary.write_failed,
+                    algorithm = %algorithm,
+                    // Aggregates only, and counts only for a small pass; see
+                    // `RederiveDedupDryRunReport`. Empty outside dry-run mode.
+                    dry_run_report = %summary
+                        .dry_run
+                        .as_ref()
+                        .map(|report| {
+                            serde_json::to_string(report)
+                                .unwrap_or_else(|_| "unserializable".to_string())
+                        })
+                        .unwrap_or_default(),
+                    "Trace Commons dedup re-derivation pass completed"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error_hash = %safe_display_error_hash(&error),
+                    "Trace Commons dedup re-derivation pass failed"
+                );
+            }
+        }
+    });
+    Ok(Json(RederiveDedupAck {
+        accepted: true,
+        limit,
+        mode,
+        algorithm,
     }))
 }
 
@@ -52718,6 +53605,12 @@ async fn score_one_submission(
                             // Same: no chunks were scored, so there is no
                             // per-chunk distribution to take a share of.
                             qualifying_token_fraction_micros: None,
+                            // Per-author perplexity (V73): absent here, never a real zero.
+                            agent_prose_perplexity_micros: None,
+                            agent_prose_tokens: None,
+                            tool_result_perplexity_micros: None,
+                            tool_result_tokens: None,
+                            attributed_token_fraction_micros: None,
                             // Not instrumented, and it never can be: this
                             // branch short-circuits before the gate service
                             // runs, so no composite was computed and no index
@@ -52989,6 +53882,8 @@ async fn gate_evaluate_worker_handler(
             // per-chunk scores the statistic is computed from, and the real
             // decision row already carries it. Unknown, not zero.
             qualifying_token_fraction_micros: None,
+            // Same again: the real decision row already carries it.
+            author_perplexity: None,
             chunk_vector_entries: Vec::new(),
             // This is a synthetic re-hydration of the already-persisted
             // decision for the credit-emission call below (no ciphertext or
@@ -57166,11 +58061,186 @@ fn witness_admitted_record(record: &TraceCommonsSubmissionRecord) -> bool {
         .is_some_and(|reason| reason == WITNESS_ADMITTED_STATUS_REASON)
 }
 
+/// Which corpus statuses carry pending credit on the contributor surface.
+///
+/// Mirrors the write side, which holds the stored estimate at 0.0 for every
+/// other status at submit, re-scrub, and review time (the
+/// Accepted -> AwaitingPiiBackstop hold keeps it). The gate's figure obeys
+/// the same rule: it is presented only on a status that carries credit, so
+/// this function does not change which statuses do.
+fn status_carries_pending_credit(status: TraceCorpusStatus) -> bool {
+    matches!(
+        status,
+        TraceCorpusStatus::Accepted | TraceCorpusStatus::AwaitingPiiBackstop
+    )
+}
+
+/// The `credit_withheld_reason` labels the perplexity driver's cost-control
+/// branches stamp on a decision it recorded WITHOUT scoring, because the
+/// same content already had a decision under this tenant: the skip-duplicate
+/// short-circuit (`skipped_duplicate`) and the canonical-hash cache
+/// (`cached`). Neither row ever receives a credit quality, so without this
+/// list they would be indistinguishable from a decision still waiting on its
+/// inline credit-quality write.
+const GATE_DUPLICATE_WITHHELD_REASONS: [&str; 2] = ["skipped_duplicate", "cached"];
+
+/// Shown beside the stored submit-time estimate until a gate figure exists.
+const PRELIMINARY_ESTIMATE_LINE: &str = "This is a preliminary estimate made at submission; \
+                                         the figure is replaced by the gate's scoring once the \
+                                         trace has been scored.";
+
+/// The gate's credit quality on the estimate's scale: `round(10 * q, 2)`,
+/// the same expression `compute_value_scorecard` applies to its online
+/// score, so a contributor comparing the two figures compares like with
+/// like.
+fn credit_points_from_quality_micros(credit_quality_micros: i64) -> f32 {
+    let quality = credit_quality_micros.clamp(0, 1_000_000) as f64 / 1_000_000.0;
+    ((10.0 * quality * 100.0).round() / 100.0) as f32
+}
+
+/// The pending-credit figure a contributor is shown for `record`, and the
+/// explanation lines that account for it.
+///
+/// The stored `credit_points_pending` is a submit-time estimate whose
+/// duplicate penalty reads same-project sessions as near-duplicates of each
+/// other, so on the pilot 12 of 13 real uploads showed 0.0 while the gate
+/// later scored them at 0.108-0.300 credit quality. Once a decision with a
+/// credit quality exists, that is the figure; until then the estimate stands,
+/// labelled as preliminary. This is presentation only: the stored column,
+/// the ledger, and the attestation surface are untouched.
+struct GateCreditPresentation {
+    credit_points_pending: f32,
+    explanation: Vec<String>,
+}
+
+fn gate_credit_presentation(
+    record: &TraceCommonsSubmissionRecord,
+    decision: Option<&StorageTraceGateCreditDecisionRow>,
+) -> GateCreditPresentation {
+    // A status that carries no credit reports its stored figure (held at 0.0
+    // by the write side) exactly as before, whatever the gate decided.
+    if !status_carries_pending_credit(record.status) {
+        return GateCreditPresentation {
+            credit_points_pending: record.credit_points_pending,
+            explanation: Vec::new(),
+        };
+    }
+    let Some(decision) = decision else {
+        return GateCreditPresentation {
+            credit_points_pending: record.credit_points_pending,
+            explanation: vec![PRELIMINARY_ESTIMATE_LINE.to_string()],
+        };
+    };
+    if let Some(credit_quality_micros) = decision.credit_quality_micros {
+        return GateCreditPresentation {
+            credit_points_pending: credit_points_from_quality_micros(credit_quality_micros),
+            explanation: vec![gate_credit_basis_line(decision)],
+        };
+    }
+    let is_duplicate = decision
+        .credit_withheld_reason
+        .as_deref()
+        .is_some_and(|reason| GATE_DUPLICATE_WITHHELD_REASONS.contains(&reason));
+    if is_duplicate {
+        return GateCreditPresentation {
+            credit_points_pending: 0.0,
+            explanation: vec![
+                "This trace duplicates an earlier submission under your account and earns no \
+                 separate credit."
+                    .to_string(),
+            ],
+        };
+    }
+    // A decision with no credit quality and no duplicate label: the inline
+    // credit-quality write did not land (it is best-effort, and the
+    // recompute pass fills it in later). Nothing to show yet, so the
+    // estimate stands with its label.
+    GateCreditPresentation {
+        credit_points_pending: record.credit_points_pending,
+        explanation: vec![PRELIMINARY_ESTIMATE_LINE.to_string()],
+    }
+}
+
+/// Names the basis of a gate-derived credit figure: the calibration schedule
+/// and how much of the trace the scoring read. Hash-only by construction --
+/// counts and a version number, never an id or a raw score.
+///
+/// Chunk NULL semantics follow `TraceGateDecisionRow`: `chunk_count` NULL is
+/// one chunk, `chunks_capped` NULL is uncapped, and `total_chunk_count` NULL
+/// is an unknown denominator that is never estimated, so a capped decision
+/// without one says only how many chunks were read.
+fn gate_credit_basis_line(decision: &StorageTraceGateCreditDecisionRow) -> String {
+    let calibration = decision
+        .credit_quality_calibration_version
+        .map(|version| format!(" (calibration V{version})"))
+        .unwrap_or_default();
+    let chunk_count = decision.chunk_count.unwrap_or(1);
+    let coverage = match (
+        decision.chunks_capped.unwrap_or(false),
+        decision.total_chunk_count,
+    ) {
+        (true, Some(total)) => format!("over {chunk_count} of {total} chunks"),
+        (true, None) => format!("over the first {chunk_count} chunks"),
+        (false, _) if chunk_count > 1 => format!("over all {chunk_count} chunks"),
+        (false, _) => "over the whole trace".to_string(),
+    };
+    format!("Credit reflects the gate's scoring{calibration} {coverage}.")
+}
+
+/// The latest gate decision for each of `records`, keyed by submission id.
+///
+/// Batched per tenant, so a 500-id status refresh costs one round trip per
+/// tenant rather than one per row. Gate decisions live only in the database:
+/// without a DB mirror there is nothing to look up, and every record keeps
+/// its estimate with the preliminary label. Callers pass only records the
+/// requesting principal can already see, which is what scopes the read
+/// below the tenant.
+async fn gate_credit_decisions_for_records<'a>(
+    state: &AppState,
+    records: impl IntoIterator<Item = &'a TraceCommonsSubmissionRecord>,
+) -> Result<BTreeMap<Uuid, StorageTraceGateCreditDecisionRow>, DatabaseError> {
+    let Some(db) = state.db_mirror.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut by_tenant: BTreeMap<&str, Vec<Uuid>> = BTreeMap::new();
+    for record in records {
+        by_tenant
+            .entry(record.tenant_id.as_str())
+            .or_default()
+            .push(record.submission_id);
+    }
+    let mut decisions = BTreeMap::new();
+    for (tenant_id, submission_ids) in by_tenant {
+        for row in db
+            .list_latest_gate_credit_decisions(tenant_id, &submission_ids)
+            .await?
+        {
+            decisions.insert(row.submission_id, row);
+        }
+    }
+    Ok(decisions)
+}
+
+/// Single-record form of `gate_credit_decisions_for_records`, for the
+/// receipt paths that answer about one submission.
+async fn gate_credit_decision_for_record(
+    state: &AppState,
+    record: &TraceCommonsSubmissionRecord,
+) -> Result<Option<StorageTraceGateCreditDecisionRow>, DatabaseError> {
+    Ok(
+        gate_credit_decisions_for_records(state, std::iter::once(record))
+            .await?
+            .remove(&record.submission_id),
+    )
+}
+
 fn receipt_from_record(
     record: &TraceCommonsSubmissionRecord,
     settlement_mode: NearSettlementMode,
+    gate_decision: Option<&StorageTraceGateCreditDecisionRow>,
 ) -> TraceSubmissionReceipt {
-    let explanation = match record.status {
+    let credit = gate_credit_presentation(record, gate_decision);
+    let mut explanation = match record.status {
         TraceCorpusStatus::Accepted => {
             let mut lines = vec!["Accepted into the private redacted corpus.".to_string()];
             // #445's argument, applied to a second indistinguishable pair of
@@ -57212,10 +58282,11 @@ fn receipt_from_record(
         TraceCorpusStatus::Expired => vec!["Expired under the retention policy.".to_string()],
         TraceCorpusStatus::Purged => vec!["Purged under the retention policy.".to_string()],
     };
+    explanation.extend(credit.explanation);
 
     TraceSubmissionReceipt {
         status: record.status.as_str().to_string(),
-        credit_points_pending: Some(record.credit_points_pending),
+        credit_points_pending: Some(credit.credit_points_pending),
         credit_points_final: record.credit_points_final,
         explanation,
     }
@@ -57225,8 +58296,9 @@ fn submission_status_from_record(
     record: &TraceCommonsSubmissionRecord,
     credit_events: &[TraceCommonsCreditLedgerRecord],
     settlement_mode: NearSettlementMode,
+    gate_decision: Option<&StorageTraceGateCreditDecisionRow>,
 ) -> TraceSubmissionStatusUpdate {
-    let receipt = receipt_from_record(record, settlement_mode);
+    let receipt = receipt_from_record(record, settlement_mode, gate_decision);
     let delayed_events = credit_events
         .iter()
         .filter(|event| event.submission_id == record.submission_id)
@@ -57272,7 +58344,11 @@ fn submission_status_from_record(
         submission_id: record.submission_id,
         trace_id: record.trace_id,
         status: record.status.as_str().to_string(),
-        credit_points_pending: record.credit_points_pending,
+        // The receipt already resolved estimate-vs-gate figure; the two
+        // surfaces must never disagree about the same record.
+        credit_points_pending: receipt
+            .credit_points_pending
+            .unwrap_or(record.credit_points_pending),
         credit_points_final: record.credit_points_final,
         credit_points_ledger: ledger_points,
         credit_points_total,

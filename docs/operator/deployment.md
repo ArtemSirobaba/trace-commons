@@ -401,6 +401,99 @@ If any of the above is missing or stalls, see
 
 ## Redeploying the binary
 
+### First: does this build carry a migration the database does not have?
+
+Check before you build, not after you install:
+
+```sh
+git diff --name-only <running build_commit> <commit to ship> -- migrations
+```
+
+`<running build_commit>` is what `/health` reports. **If that prints anything,
+a plain install will take the service down**, on any deployment that runs the
+least-privilege role split the pilot does.
+
+Ingest applies migrations at boot and treats a failure as fatal. On the pilot,
+ingest connects as a runtime role that is not the owner of any table — every
+table is owned by a separate migrator role.
+[`invite-free-admission.md`](invite-free-admission.md) §1.3 requires that split
+for the admission tables; the pilot applies it to all of them. A runtime
+role cannot run DDL, so the first new migration fails, ingest exits, and
+systemd restarts it in a loop. This happened on 2026-09-21: a build carrying
+V63 through V73 died on `ERROR: must be owner of table device_keys`, restarted
+58 times, and was down for about ten minutes until it was rolled back. Nothing
+was applied, because the first statement of the first new migration is what
+failed.
+
+So apply new migrations **as the migrator, before installing the binary**, by
+either route in `invite-free-admission.md` §1.3: point `DATABASE_URL` at the
+migrator role for one boot, or apply the files with `psql` as the migrator and
+record them in `_trace_commons_migrations`. Then grant the runtime role what
+the new tables need; the features that add tables document their own grant
+blocks (for example [`native-admission-session.md`](native-admission-session.md)
+and [`mission-insight-rewards.md`](mission-insight-rewards.md)). Only then
+install. An older binary ignores migration versions it does not know, so
+applying them ahead of the binary is safe for the build still running.
+
+Two more things this incident showed:
+
+- **The build publishes both binaries and moves both `latest.txt` pointers**,
+  ingest and issuer, even when you mean to deploy one. After a rollback, a bare
+  `pull-and-install.sh` would reinstall the build you just backed out. Point
+  each `latest.txt` back at the running build, or always pass the tag.
+- **"The issuer's source did not change" is not "the issuer binary did not
+  change."** It links the same library crate as ingest; its published sha256
+  differed across a range in which its own `bin` file was untouched.
+
+### V74: the public-run functions move to a runtime role
+
+V64 meant to close its four public-run definer functions
+(`trace_public_run_page`, `trace_resolve_public_run_source`,
+`trace_public_run_would_cycle`, `trace_public_run_retained_source`) to PUBLIC
+and grant EXECUTE to the migrator, but it did so after leaving the roles that
+own them. A non-superuser migrator may not change the ACL of a function it does
+not own, and PostgreSQL warns rather than fails there, so on every deployment
+migrated by its own owner V64 recorded as applied with PUBLIC still holding
+EXECUTE on all four and nobody holding an explicit grant. Every role could call
+them; they were reachable because nothing had been closed.
+
+V74 repairs that from inside the owner roles, and the runtime's EXECUTE now
+comes from membership in a new `NOLOGIN NOBYPASSRLS` role,
+`trace_public_run_runtime`, the way `trace_reward_runtime` works. The migrator
+keeps EXECUTE directly, so a deployment that migrates and serves as one role
+(CI, local development) needs nothing further.
+
+**A least-privilege deployment must grant the runtime role in the same step as
+V74.** V74 takes PUBLIC's EXECUTE away, so from the moment it commits an ingest
+login that is not the migrator loses the public-run pages -- every
+`/v1/community/runs/{slug}` read and every publication returns a permission
+error -- until the grant exists. Apply V74 as the migrator and, in the same session or
+the same `psql` script, run:
+
+```sql
+GRANT trace_public_run_runtime TO <ingest runtime login>;
+```
+
+On the pilot that is, as the migrator:
+
+```sql
+GRANT trace_public_run_runtime TO trace_ingest_runtime;
+```
+
+V74 also makes the unpublish trigger
+(`trace_unpublish_run_when_submission_leaves_accepted`, fired when a
+submission's status leaves `accepted`) a `SECURITY DEFINER` function owned by
+`trace_public_run_unpublisher`, a role that holds only the columns its one
+UPDATE touches. Under V64 the trigger ran as the caller and needed UPDATE on
+`trace_public_runs`, which the ingest runtime has no other reason to hold; a
+deployment that added `GRANT SELECT, UPDATE ON trace_public_runs TO <ingest
+runtime login>` by hand to get past `permission denied for table
+trace_public_runs` no longer needs it and may revoke it. The caller's tenant
+setting carries into the definer function, so the forced tenant policy still
+scopes the update to the caller's own tenant.
+
+### Build and install
+
 The pilot host has no Rust toolchain; binaries are built by Cloud Build and
 pulled from GCS. From a clean checkout at the commit you intend to ship:
 

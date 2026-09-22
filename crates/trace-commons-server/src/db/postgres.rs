@@ -7,8 +7,14 @@ use std::collections::HashSet;
 
 #[path = "postgres_account_onboarding.rs"]
 mod account_onboarding;
+#[path = "postgres_mission_catalog.rs"]
+mod mission_catalog;
 #[path = "postgres_public_run.rs"]
 mod public_run;
+#[path = "postgres_reward_participant.rs"]
+mod reward_participant;
+#[cfg(test)]
+mod reward_upgrade_tests;
 
 use async_trait::async_trait;
 use deadpool_postgres::Pool;
@@ -209,6 +215,18 @@ pub const TRACE_COMMONS_RLS_TABLES: &[&str] = &[
     "trace_account_merge_proposals",
     "trace_community_withdrawal_evictions",
     "trace_public_runs",
+    "trace_reward_operators",
+    "trace_reward_programs",
+    "trace_reward_reservations",
+    "trace_reward_decisions",
+    "trace_reward_awards",
+    "trace_reward_invalidations",
+    "trace_reward_offers",
+    "trace_reward_offer_controls",
+    "trace_reward_participant_logins",
+    "trace_reward_principals",
+    "trace_reward_principal_accounts",
+    "trace_reward_participant_reservations",
 ];
 
 const TRACE_COMMONS_RLS_POLICY_EXPRESSION_VARIANTS: &[&str] = &[
@@ -1292,10 +1310,110 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         "token_rescrub_revocation",
         include_str!("../../../../migrations/V68__token_rescrub_revocation.sql"),
     ),
+    (
+        69,
+        "mission_insight_rewards",
+        include_str!("../../../../migrations/V69__mission_insight_rewards.sql"),
+    ),
+    (
+        70,
+        "reward_history_pagination",
+        include_str!("../../../../migrations/V70__reward_history_pagination.sql"),
+    ),
+    (
+        71,
+        "reward_participant_access",
+        include_str!("../../../../migrations/V71__reward_participant_access.sql"),
+    ),
+    (
+        72,
+        "published_mission_packages",
+        include_str!("../../../../migrations/V72__published_mission_packages.sql"),
+    ),
+    // V73 adds per-author perplexity (shadow mode). Additive, nullable and
+    // backfill-free here: pre-V73 rows keep NULL until the author-only
+    // re-score route fills them.
+    (
+        73,
+        "trace_gate_decision_author_perplexity",
+        include_str!("../../../../migrations/V73__trace_gate_decision_author_perplexity.sql"),
+    ),
+    // V74 repairs V64's function ACL, which a non-superuser migrator could not
+    // set (it had already left the owner roles), and makes the unpublish
+    // trigger a definer function so the ingest login needs no grant on
+    // trace_public_runs. Runtime EXECUTE moves to trace_public_run_runtime.
+    (
+        74,
+        "public_run_function_acl",
+        include_str!("../../../../migrations/V74__public_run_function_acl.sql"),
+    ),
 ];
 
 #[async_trait]
 impl Database for PgBackend {
+    async fn get_reward_offer(
+        &self,
+        program: Uuid,
+    ) -> Result<crate::reward_participant::RewardOffer, crate::mission_rewards::RewardError> {
+        self.participant_reward_offer(program).await
+    }
+
+    async fn get_mission_publication(
+        &self,
+        mission: Uuid,
+    ) -> Result<
+        trace_commons_protocol::mission_catalog::MissionPublication,
+        crate::mission_rewards::RewardError,
+    > {
+        self.public_mission_get(mission).await
+    }
+
+    async fn list_mission_catalog(
+        &self,
+        query: &trace_commons_protocol::mission_catalog::MissionCatalogQuery,
+    ) -> Result<
+        trace_commons_protocol::mission_catalog::MissionCatalogPage,
+        crate::mission_rewards::RewardError,
+    > {
+        self.public_mission_list(query).await
+    }
+
+    async fn reserve_reward_offer(
+        &self,
+        tenant: &str,
+        account: Uuid,
+        program: Uuid,
+        request: &crate::reward_participant::RewardReservationRequest,
+    ) -> Result<crate::reward_participant::RewardReservation, crate::mission_rewards::RewardError>
+    {
+        self.participant_reward_reserve(tenant, account, program, request)
+            .await
+    }
+
+    async fn get_reward_reservation(
+        &self,
+        tenant: &str,
+        account: Uuid,
+        reservation: Uuid,
+    ) -> Result<crate::reward_participant::RewardReservation, crate::mission_rewards::RewardError>
+    {
+        self.participant_reward_reservation(tenant, account, reservation)
+            .await
+    }
+
+    async fn get_reward_history(
+        &self,
+        tenant: &str,
+        account: Uuid,
+        query: &crate::reward_participant::RewardHistoryQuery,
+    ) -> Result<
+        crate::reward_participant::RewardParticipantHistory,
+        crate::mission_rewards::RewardError,
+    > {
+        self.participant_reward_history(tenant, account, query)
+            .await
+    }
+
     async fn admission_runtime_ready(&self) -> Result<bool, DatabaseError> {
         self.check_admission_runtime().await
     }
@@ -4314,6 +4432,15 @@ impl Database for PgBackend {
         let mut client = self.trace_pool().get().await.map_err(DatabaseError::from)?;
         let tx = Self::begin_trace_tenant_transaction(&mut client, tenant_id).await?;
 
+        // Reward reservations use the same tenant lock. Acquire it before any
+        // proposal/account row locks so a merge cannot race identity allocation.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 691))",
+            &[&tenant_id],
+        )
+        .await
+        .map_err(DatabaseError::Postgres)?;
+
         // Load + consume the proposal atomically. The conditional UPDATE
         // re-validates OWNERSHIP (surviving_account_id = A, the auth-derived
         // caller), single-use (consumed_at IS NULL), and freshness (expires_at >
@@ -4367,6 +4494,24 @@ impl Database for PgBackend {
         if closed_at.is_some() {
             return Ok(None);
         }
+
+        // The reward hook re-reads the proposal and admits it only when its
+        // `xmin` is this transaction's id, which is how it knows the consuming
+        // UPDATE above is its own. That holds only while the consume runs in
+        // the transaction proper: wrapping it in a SAVEPOINT, or moving it
+        // inside a plpgsql EXCEPTION block, stamps `xmin` with a
+        // subtransaction id and the hook refuses every merge.
+        tx.execute(
+            "SELECT public.trace_reward_accounts_merge($1, $2, $3, $4)",
+            &[
+                &tenant_id,
+                &surviving_account_id,
+                &absorbed_account_id,
+                &proposal_id,
+            ],
+        )
+        .await
+        .map_err(reward_merge_refusal)?;
 
         // Move B's ACTIVE principal links onto A. PK-column UPDATE; collision-free
         // because (tenant_id, principal_ref) is UNIQUE and a principal has at most
@@ -4714,8 +4859,14 @@ impl Database for PgBackend {
                 "SELECT tenant_id, decision_id,
                         COALESCE(perplexity_micros, 0)      AS perplexity_micros,
                         COALESCE(peak_perplexity_micros, 0) AS peak_perplexity_micros,
-                        COALESCE(novelty_score_micros, 0)   AS novelty_score_micros
+                        COALESCE(novelty_score_micros, 0)   AS novelty_score_micros,
+                        decided_at
                  FROM trace_gate_decisions
+                 -- A row the gate never scored has no credit quality. The
+                 -- driver's skip-duplicate branch records perplexity 0 and
+                 -- leaves credit quality NULL; scoring it here would hand
+                 -- every skipped duplicate the graded-floor product.
+                 WHERE COALESCE(perplexity_micros, 0) > 0
                  ORDER BY decided_at ASC
                  LIMIT $1",
                 &[&limit],
@@ -4730,6 +4881,7 @@ impl Database for PgBackend {
                 perplexity_micros: row.get("perplexity_micros"),
                 peak_perplexity_micros: row.get("peak_perplexity_micros"),
                 novelty_score_micros: row.get("novelty_score_micros"),
+                decided_at: row.get("decided_at"),
             })
             .collect())
     }
@@ -4767,6 +4919,51 @@ impl Database for PgBackend {
                 decision_id: row.get("decision_id"),
                 dedup_cluster_id: row.get("dedup_cluster_id"),
                 dedup_simhash: row.get("dedup_simhash"),
+                dedup_signal_version: row.get("dedup_signal_version"),
+            })
+            .collect())
+    }
+
+    async fn list_dedup_rederive_rows(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<crate::trace_corpus_storage::DedupRederiveRow>, DatabaseError> {
+        let pool = self
+            .gate_driver_pool
+            .as_ref()
+            .ok_or_else(|| DatabaseError::Pool("gate-driver pool not configured".to_string()))?;
+        let client = pool.get().await.map_err(DatabaseError::from)?;
+        // No tenant GUC: the trace_gate_driver role's permissive cross-tenant
+        // SELECT policies authorize this read across every tenant's decisions.
+        // Every column here is in the role's column-scoped grants (V45 for
+        // the identifiers, `decided_at` and the three V40 dedup columns; V57
+        // for the stamp), so the query needs no migration.
+        //
+        // `decision_id` is the tie-break so two decisions at one instant
+        // enumerate in the same order every run: the sweep is
+        // order-dependent, and its idempotence depends on this.
+        let rows = client
+            .query(
+                "SELECT tenant_id, submission_id, decision_id, decided_at,
+                        dedup_simhash, dedup_cluster_id, dedup_cluster_size,
+                        dedup_signal_version
+                 FROM trace_gate_decisions
+                 ORDER BY decided_at ASC, decision_id ASC
+                 LIMIT $1",
+                &[&limit],
+            )
+            .await
+            .map_err(DatabaseError::Postgres)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::trace_corpus_storage::DedupRederiveRow {
+                tenant_id: row.get("tenant_id"),
+                submission_id: row.get("submission_id"),
+                decision_id: row.get("decision_id"),
+                decided_at: row.get("decided_at"),
+                dedup_simhash: row.get("dedup_simhash"),
+                dedup_cluster_id: row.get("dedup_cluster_id"),
+                dedup_cluster_size: row.get("dedup_cluster_size"),
                 dedup_signal_version: row.get("dedup_signal_version"),
             })
             .collect())
@@ -5059,6 +5256,25 @@ impl Database for PgBackend {
             })
             .collect())
     }
+}
+
+/// The reward hook refuses a merge that would put one payout identity over a
+/// program's participant cap, or leave it holding two reservations in one work
+/// namespace -- exactly the states `trace_reward_participant_reserve` refuses.
+/// Surface those two as the named control so the refusal is legible; every
+/// other driver error stays opaque.
+fn reward_merge_refusal(error: tokio_postgres::Error) -> DatabaseError {
+    const NAMED: [&str; 2] = [
+        "reward_merge_participant_cap",
+        "reward_merge_work_duplicate",
+    ];
+    if let Some(db) = error.as_db_error()
+        && db.code().code() == "P0001"
+        && let Some(label) = NAMED.iter().find(|label| **label == db.message())
+    {
+        return DatabaseError::Constraint((*label).to_string());
+    }
+    DatabaseError::Postgres(error)
 }
 
 fn device_key_record_from_row(row: Row) -> crate::db::DeviceKeyRecord {
@@ -5665,6 +5881,28 @@ mod tests {
         );
     }
 
+    /// Shadow-mode columns: nullable and default-free, so a row written
+    /// before the migration, or scored by a backend that reports no token
+    /// lengths, reads as "not computed" rather than as a real zero.
+    #[test]
+    fn v73_adds_nullable_author_perplexity_columns() {
+        const V73: &str =
+            include_str!("../../../../migrations/V73__trace_gate_decision_author_perplexity.sql");
+        for col in [
+            "agent_prose_perplexity_micros",
+            "agent_prose_tokens",
+            "tool_result_perplexity_micros",
+            "tool_result_tokens",
+            "attributed_token_fraction_micros",
+        ] {
+            assert!(
+                V73.contains(&format!("ADD COLUMN IF NOT EXISTS {col} BIGINT")),
+                "V73 must add {col}"
+            );
+        }
+        assert!(!V73.contains("NOT NULL") && !V73.contains("DEFAULT"));
+    }
+
     /// V55 gives the public register-stats endpoint (Task 4) a way to read
     /// one aggregate row without a tenant. This test runs WITHOUT
     /// PostgreSQL, so it is the only thing CI can ever check about the
@@ -6200,6 +6438,372 @@ mod tests {
         );
     }
 
+    /// A function may not carry a `SET <custom.parameter> = ...` clause.
+    ///
+    /// PostgreSQL checks that clause when the function is created, and for a
+    /// parameter it has no definition of -- every `trace_commons.*` setting --
+    /// it allows only a true superuser (on 15 and later, also a role holding
+    /// `SET` on that parameter, which only a superuser can grant). A database
+    /// migrated by its least-privileged owner, which is every managed
+    /// PostgreSQL and the shape `docs/operator/deployment.md` tells operators
+    /// to build, dies there with `permission denied to set parameter`. V64, V71
+    /// and V72 shipped six such clauses and no test noticed, because every
+    /// suite migrates as a superuser.
+    ///
+    /// Clearing the setting in the body with `set_config(name, '', true)` and
+    /// putting the caller's value back before returning does the same job and
+    /// needs no privilege. `a_non_superuser_owner_can_apply_every_migration` in
+    /// `tests/migration_atomicity_pg.rs` proves the point against a real
+    /// server; this pins it where no PostgreSQL runs.
+    ///
+    /// `SET search_path = ...` is a parameter PostgreSQL defines, so anyone may
+    /// attach it; the dot in the name is what marks a custom one. A clause has
+    /// no terminating `;` -- a `SET` statement inside a body does.
+    #[test]
+    fn no_migration_attaches_a_custom_parameter_to_a_function() {
+        assert!(
+            super::MIGRATIONS.len() >= 60,
+            "the MIGRATIONS table came back with {} rows: an empty or truncated \
+             table passes the check below vacuously",
+            super::MIGRATIONS.len()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (version, name, sql) in super::MIGRATIONS {
+            for (index, line) in sql.lines().enumerate() {
+                let normalized = line.trim().to_ascii_lowercase();
+                let mut words = normalized.split_whitespace();
+                if words.next() != Some("set") {
+                    continue;
+                }
+                let Some(parameter) = words.next() else {
+                    continue;
+                };
+                if parameter.contains('.') && !normalized.ends_with(';') {
+                    offenders.push(format!(
+                        "V{version} ({name}) line {}: {parameter}",
+                        index + 1
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these functions carry a SET clause for a custom parameter, which only a \
+             superuser may create; clear it in the body with set_config instead:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// `ALTER ROLE` may not name SUPERUSER, BYPASSRLS or REPLICATION, in either
+    /// polarity.
+    ///
+    /// PostgreSQL gates those on the attribute being mentioned, not on the value
+    /// asked for: `ALTER ROLE r NOSUPERUSER` is refused to everyone but a
+    /// superuser -- `must be superuser to alter superuser roles or change
+    /// superuser attribute` -- although it could only ever take the privilege
+    /// away. V69 and V71 used it to pin five roles down after creating them,
+    /// which stopped a non-superuser owner as surely as the `SET` clause did.
+    ///
+    /// The intent was sound: a role of that name might already exist on the
+    /// server with more than the migration would have given it. So check the
+    /// catalog and refuse, which anyone may do, instead of coercing, which only
+    /// a superuser may. `CREATE ROLE ... NOBYPASSRLS` is not affected; creation
+    /// is gated on the value.
+    #[test]
+    fn no_migration_alters_a_role_attribute_reserved_to_superusers() {
+        const RESERVED: &[&str] = &[
+            "superuser",
+            "nosuperuser",
+            "bypassrls",
+            "nobypassrls",
+            "replication",
+            "noreplication",
+        ];
+
+        assert!(
+            super::MIGRATIONS.len() >= 60,
+            "the MIGRATIONS table came back with {} rows: an empty or truncated \
+             table passes the check below vacuously",
+            super::MIGRATIONS.len()
+        );
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (version, name, sql) in super::MIGRATIONS {
+            for (index, line) in sql.lines().enumerate() {
+                let normalized = line.trim().to_ascii_lowercase();
+                let words: Vec<&str> = normalized
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .filter(|word| !word.is_empty())
+                    .collect();
+                if words.len() < 2 || words[0] != "alter" || words[1] != "role" {
+                    continue;
+                }
+                if let Some(attribute) = words.iter().find(|word| RESERVED.contains(word)) {
+                    offenders.push(format!(
+                        "V{version} ({name}) line {}: {attribute}",
+                        index + 1
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these ALTER ROLE statements name an attribute only a superuser may mention; \
+             check pg_roles and refuse instead:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// A role must hold CREATE on `public` at the moment something is given to
+    /// it.
+    ///
+    /// PostgreSQL checks that on every `ALTER ... OWNER TO`. Through 14 every
+    /// role passed by way of PUBLIC; 15 took CREATE away from PUBLIC, and a
+    /// transfer to a role that was never granted it is refused to anyone but a
+    /// superuser: `permission denied for schema public`. V64 and V71 forgot the
+    /// grant for three roles, which no suite saw on either count -- they migrate
+    /// as a superuser, and the local server most of them ran on was 14.
+    ///
+    /// V59's shape is the one to copy: grant CREATE, transfer, revoke it again.
+    /// This reads each file in statement order and tracks grants and revokes, so
+    /// a transfer after the revoke is caught as well as one with no grant.
+    #[test]
+    fn no_migration_transfers_ownership_to_a_role_without_create_on_the_schema() {
+        assert!(
+            super::MIGRATIONS.len() >= 60,
+            "the MIGRATIONS table came back with {} rows: an empty or truncated \
+             table passes the check below vacuously",
+            super::MIGRATIONS.len()
+        );
+
+        fn roles(list: &str) -> Vec<String> {
+            list.split(',')
+                .map(|role| role.trim().trim_matches('"').to_string())
+                .filter(|role| !role.is_empty())
+                .collect()
+        }
+
+        let mut transfers = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (version, name, sql) in super::MIGRATIONS {
+            let uncommented: String = sql
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut may_create: std::collections::BTreeSet<String> = Default::default();
+            for statement in uncommented.split(';') {
+                let words: Vec<&str> = statement.split_whitespace().collect();
+                let lower = words.join(" ").to_ascii_lowercase();
+                if let Some(rest) = lower.strip_prefix("grant create on schema public to ") {
+                    may_create.extend(roles(rest));
+                } else if let Some(rest) =
+                    lower.strip_prefix("revoke create on schema public from ")
+                {
+                    for role in roles(rest) {
+                        may_create.remove(&role);
+                    }
+                } else if let Some(at) = lower.find(" owner to ") {
+                    let role = lower[at + " owner to ".len()..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    transfers += 1;
+                    if role != "current_user" && !may_create.contains(&role) {
+                        offenders.push(format!("V{version} ({name}): OWNER TO {role}"));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            transfers >= 30,
+            "only {transfers} ownership transfers were recognised; the migrations hold more \
+             than thirty, so the statement scan has stopped seeing them"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these transfers hand an object to a role that does not hold CREATE on the \
+             schema at that point, which PostgreSQL 15 and later refuse:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// A `GRANT` or `REVOKE ... ON FUNCTION` must run while the migrator can
+    /// still act for the function's owner.
+    ///
+    /// Only an owner, a member of the owner role, or a superuser may change a
+    /// function's ACL. For anyone else PostgreSQL does not refuse: it prints
+    /// `WARNING: no privileges could be revoked` (or `were granted`) and
+    /// carries on, so the migration records as applied with the ACL untouched.
+    /// V64 handed its four definer functions to `trace_public_run_reader` and
+    /// `trace_public_run_graph_guard`, left both roles, and only then revoked
+    /// PUBLIC's EXECUTE and granted its own -- eight no-ops on the pilot, which
+    /// migrates as the database's non-superuser owner. V74 repairs the ACL; it
+    /// cannot be repaired in V64, which the pilot has already recorded.
+    ///
+    /// Read in statement order across every migration, since a function keeps
+    /// its owner from one migration to the next: `ALTER FUNCTION ... OWNER TO`
+    /// records the owner, `GRANT <role> TO CURRENT_USER` and `REVOKE <role>
+    /// FROM CURRENT_USER` track membership, `EXECUTE ... WITH GRANT OPTION`
+    /// held by the migrator also counts, and V60's `IF pg_has_role(current_user,
+    /// ...) THEN` block counts as membership for its own length. A function
+    /// never transferred is the migrator's own.
+    #[test]
+    fn no_migration_changes_a_function_acl_it_cannot_change() {
+        /// V64 is the defect this test was written for, and it is recorded on
+        /// deployments already. V74 repairs its ACL; V64 stays as it is.
+        const REPAIRED_BY_A_LATER_MIGRATION: &[i32] = &[64];
+
+        assert!(
+            super::MIGRATIONS.len() >= 60,
+            "the MIGRATIONS table came back with {} rows: an empty or truncated \
+             table passes the check below vacuously",
+            super::MIGRATIONS.len()
+        );
+
+        fn strip_parenthesised(text: &str) -> String {
+            let mut depth = 0usize;
+            let mut out = String::new();
+            for c in text.chars() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    _ if depth == 0 => out.push(c),
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        /// The function names in a `f(TEXT, INTEGER), public.g(UUID)` list.
+        fn function_names(list: &str) -> Vec<String> {
+            strip_parenthesised(list)
+                .split(',')
+                .map(|name| name.trim().trim_start_matches("public.").to_string())
+                .filter(|name| !name.is_empty())
+                .collect()
+        }
+
+        let mut owner: std::collections::BTreeMap<String, String> = Default::default();
+        let mut member: std::collections::BTreeSet<String> = Default::default();
+        let mut grantable: std::collections::BTreeSet<String> = Default::default();
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (version, name, sql) in super::MIGRATIONS {
+            let uncommented: String = sql
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut guarded_as: Option<String> = None;
+            for statement in uncommented.split(';') {
+                let lower = statement
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase();
+                let words: Vec<&str> = lower.split_whitespace().collect();
+
+                if let Some(at) = lower.find("pg_has_role(current_user,") {
+                    let role = lower[at + "pg_has_role(current_user,".len()..]
+                        .split(',')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .trim_matches('\'')
+                        .to_string();
+                    guarded_as = Some(role);
+                }
+                if lower.contains("end $$") {
+                    guarded_as = None;
+                }
+
+                if let Some(at) = lower.find(" owner to ") {
+                    let role = lower[at + " owner to ".len()..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_matches('"')
+                        .to_string();
+                    if let Some(rest) = lower.strip_prefix("alter function ") {
+                        for function in function_names(&rest[..rest.find(" owner to ").unwrap()]) {
+                            owner.insert(function, role.clone());
+                        }
+                    }
+                    continue;
+                }
+
+                for window in words.windows(4) {
+                    match window {
+                        ["grant", role, "to", "current_user" | "current_user;"] => {
+                            member.insert(role.trim_matches(',').to_string());
+                        }
+                        ["revoke", role, "from", "current_user" | "current_user;"] => {
+                            member.remove(role.trim_matches(','));
+                        }
+                        _ => {}
+                    }
+                }
+
+                let Some(at) = lower.find(" on function ") else {
+                    continue;
+                };
+                let is_grant = lower.starts_with("grant ") || lower.contains(" grant ");
+                let separator = if is_grant { " to " } else { " from " };
+                let list = &lower[at + " on function ".len()..];
+                let Some(end) = list.find(separator) else {
+                    continue;
+                };
+                let grantees = &list[end + separator.len()..];
+                for function in function_names(&list[..end]) {
+                    checked += 1;
+                    let owner_role = owner.get(&function).cloned();
+                    let allowed = match &owner_role {
+                        None => true,
+                        Some(role) => {
+                            role == "current_user"
+                                || member.contains(role)
+                                || guarded_as.as_deref() == Some(role)
+                                || grantable.contains(&function)
+                        }
+                    };
+                    if !allowed && !REPAIRED_BY_A_LATER_MIGRATION.contains(version) {
+                        offenders.push(format!(
+                            "V{version} ({name}): {} on {function}, owned by {}",
+                            if is_grant { "GRANT" } else { "REVOKE" },
+                            owner_role.unwrap_or_default()
+                        ));
+                    }
+                    if is_grant
+                        && grantees.contains("current_user")
+                        && grantees.contains("with grant option")
+                    {
+                        grantable.insert(function);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked >= 60,
+            "only {checked} function grants and revokes were recognised; the migrations \
+             hold more than sixty, so the statement scan has stopped seeing them"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these statements change a function's ACL while the migrator is neither its \
+             owner nor a member of the owner role; a non-superuser migrator gets a WARNING \
+             and no change, so grant and revoke before leaving the role:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     /// The apply and the record must commit together. Read against the source
     /// rather than a live database because the loop's non-atomic form was
     /// invisible to every test in the suite: both statements succeed, and only
@@ -6377,6 +6981,7 @@ mod tests {
     #[test]
     fn trace_commons_rls_registry_matches_migration_policy_coverage() {
         let central_policy_migrations = [
+            include_str!("../../../../migrations/V71__reward_participant_access.sql"),
             include_str!("../../../../migrations/V18__trace_central_rls_tenant_predicate.sql"),
             include_str!("../../../../migrations/V21__trace_near_credit_account_outbox.sql"),
             include_str!("../../../../migrations/V26__trace_contributor_profiles.sql"),
@@ -6391,8 +6996,10 @@ mod tests {
             include_str!("../../../../migrations/V58__near_account_provisioning.sql"),
             include_str!("../../../../migrations/V65__token_distribution_bundles.sql"),
             include_str!("../../../../migrations/V64__trace_public_runs.sql"),
+            include_str!("../../../../migrations/V69__mission_insight_rewards.sql"),
         ];
         let force_rls_migrations = [
+            include_str!("../../../../migrations/V71__reward_participant_access.sql"),
             include_str!("../../../../migrations/V6__trace_force_rls.sql"),
             include_str!("../../../../migrations/V11__trace_ranking_worker_runs.sql"),
             include_str!("../../../../migrations/V14__trace_ranking_preference_labels.sql"),
@@ -6411,6 +7018,7 @@ mod tests {
             include_str!("../../../../migrations/V58__near_account_provisioning.sql"),
             include_str!("../../../../migrations/V65__token_distribution_bundles.sql"),
             include_str!("../../../../migrations/V64__trace_public_runs.sql"),
+            include_str!("../../../../migrations/V69__mission_insight_rewards.sql"),
         ];
 
         for table in TRACE_COMMONS_RLS_TABLES {

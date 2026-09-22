@@ -1936,6 +1936,16 @@ pub struct TraceGateDecisionRow {
     /// or calibration will read every unmeasured row as the worst possible
     /// observation.
     pub qualifying_token_fraction_micros: Option<i64>,
+    /// Per-author perplexity (migration V73). Shadow mode. All five are
+    /// `None` when nothing was attributed -- pre-V73 rows and backends that
+    /// report no token lengths. A `*_perplexity_micros` is also `None` when
+    /// that author had no attributed tokens. Readers MUST NOT default any of
+    /// them.
+    pub agent_prose_perplexity_micros: Option<i64>,
+    pub agent_prose_tokens: Option<i64>,
+    pub tool_result_perplexity_micros: Option<i64>,
+    pub tool_result_tokens: Option<i64>,
+    pub attributed_token_fraction_micros: Option<i64>,
     /// The composite credit-quality score `q` * 1e6 as computed at scoring
     /// time under the calibration active then (migration V53, #199).
     ///
@@ -1992,6 +2002,9 @@ pub struct GateWorkItem {
 /// Numeric inputs for shadow credit-quality scoring of one decision row, read
 /// cross-tenant through the narrow `trace_gate_driver` pool (no tenant GUC).
 /// The peak/novelty are stored micros; NULLs map to 0 (below-floor -> q 0).
+/// Only decisions the gate actually scored are inputs: a row with perplexity 0
+/// (the skip-duplicate branch) is never enumerated, so its credit quality
+/// stays NULL, as the inline path leaves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateCreditInput {
     pub tenant_id: String,
@@ -1999,6 +2012,11 @@ pub struct GateCreditInput {
     pub perplexity_micros: i64,
     pub peak_perplexity_micros: i64,
     pub novelty_score_micros: i64,
+    /// When the decision was made. Selects the calibration: a calibration
+    /// belongs to a scorer model, and the batch pass must score each row with
+    /// the constants in force when it was decided
+    /// (`credit_quality::constants_at`), not with whatever is newest.
+    pub decided_at: DateTime<Utc>,
 }
 
 /// Cross-trace dedup cluster signal for one decision row (migration V40),
@@ -2020,23 +2038,56 @@ pub struct DedupSignalRow {
     pub dedup_signal_version: Option<String>,
 }
 
+/// Decode a stored `dedup_signal_version`. `NULL` (and an empty string,
+/// which is a `NULL` that survived a round trip through a text column) reads
+/// as [`crate::dedup_assign::LEGACY_DEDUP_SIGNAL_VERSION`], never as
+/// "unknown": an unknown would have to cluster either with everything or
+/// with nothing, and both are wrong.
+///
+/// This is the ONE place a stored `NULL` is decoded; the two row types that
+/// carry the column both go through it. A caller that decoded it for itself
+/// would be a second answer to the question, free to drift from this one.
+fn effective_dedup_signal_version(stored: Option<&str>) -> &str {
+    match stored {
+        Some(v) if !v.is_empty() => v,
+        _ => crate::dedup_assign::LEGACY_DEDUP_SIGNAL_VERSION,
+    }
+}
+
 impl DedupSignalRow {
-    /// The version this row's `dedup_simhash` was derived under. `NULL` (and
-    /// an empty string, which is a `NULL` that survived a round trip through
-    /// a text column) reads as
-    /// [`crate::dedup_assign::LEGACY_DEDUP_SIGNAL_VERSION`], never as
-    /// "unknown": an unknown would have to cluster either with everything or
-    /// with nothing, and both are wrong.
-    ///
-    /// This is the ONE place a stored `NULL` is decoded, and it sits on the
-    /// row because that is where the `Option` originates. A caller that
-    /// decoded it for itself would be a second answer to the question, free
-    /// to drift from this one.
+    /// The version this row's `dedup_simhash` was derived under; see
+    /// [`effective_dedup_signal_version`].
     pub fn effective_signal_version(&self) -> &str {
-        match self.dedup_signal_version.as_deref() {
-            Some(v) if !v.is_empty() => v,
-            _ => crate::dedup_assign::LEGACY_DEDUP_SIGNAL_VERSION,
-        }
+        effective_dedup_signal_version(self.dedup_signal_version.as_deref())
+    }
+}
+
+/// One decision row as the dedup re-derivation pass enumerates it (through
+/// the narrow `trace_gate_driver` pool, no tenant GUC, every column granted
+/// by V45 and V57). Carries what the pass needs to decide whether to reuse
+/// the stored value or re-derive it (`dedup_simhash`, `dedup_signal_version`),
+/// what to load if it must (`tenant_id`, `submission_id`), and what is stored
+/// so it can write only rows that changed (`dedup_cluster_id`,
+/// `dedup_cluster_size`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupRederiveRow {
+    pub tenant_id: String,
+    pub submission_id: Uuid,
+    pub decision_id: Uuid,
+    pub decided_at: DateTime<Utc>,
+    pub dedup_simhash: Option<i64>,
+    pub dedup_cluster_id: Option<Uuid>,
+    pub dedup_cluster_size: Option<i32>,
+    /// The stored stamp (V57); `None` for a row recorded before the column
+    /// existed. Read through [`Self::effective_signal_version`].
+    pub dedup_signal_version: Option<String>,
+}
+
+impl DedupRederiveRow {
+    /// The version this row's `dedup_simhash` was derived under; see
+    /// [`effective_dedup_signal_version`].
+    pub fn effective_signal_version(&self) -> &str {
+        effective_dedup_signal_version(self.dedup_signal_version.as_deref())
     }
 }
 
@@ -2138,6 +2189,27 @@ pub struct TraceScoreBySubmissionRow {
 pub struct OwnSubmissionScoreRow {
     pub submission_id: Uuid,
     pub score: Option<TraceScoreBySubmissionRow>,
+}
+
+/// The credit-bearing slice of a submission's latest gate decision, as the
+/// contributor status surface presents it in place of the submit-time
+/// estimate. Read tenant-scoped by `list_latest_gate_credit_decisions`.
+///
+/// `credit_quality_micros` is `None` on a cost-control decision (a
+/// `skipped_duplicate` or `cached` row, told apart from a genuine unscored
+/// decision by `credit_withheld_reason`) and on the rare decision whose
+/// inline credit-quality write failed. Chunk columns keep
+/// `TraceGateDecisionRow`'s NULL semantics: `chunk_count` NULL reads as 1,
+/// `chunks_capped` NULL as false, `total_chunk_count` NULL as unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceGateCreditDecisionRow {
+    pub submission_id: Uuid,
+    pub credit_quality_micros: Option<i64>,
+    pub credit_quality_calibration_version: Option<i32>,
+    pub credit_withheld_reason: Option<String>,
+    pub chunk_count: Option<i32>,
+    pub total_chunk_count: Option<i32>,
+    pub chunks_capped: Option<bool>,
 }
 
 /// Safe, label-only missing-control name returned when a storage backend has
@@ -3053,6 +3125,32 @@ pub trait TraceCorpusStore: Send + Sync {
         Ok(())
     }
 
+    /// Write ONLY the five per-author perplexity columns (migration V73) on
+    /// the latest decision row for `submission_id`, in migration order:
+    /// agent-prose perplexity, agent-prose tokens, tool-result perplexity,
+    /// tool-result tokens, attributed fraction. Every other column --
+    /// including `perplexity_micros`, `peak_perplexity_micros` and
+    /// `perplexity_passed` -- is left untouched, so a backfill scored by a
+    /// different model than the row was gated under cannot rewrite gating
+    /// history. Implementations MUST scope the update by `tenant_id`.
+    ///
+    /// Defaults to a log-once warning + no-op, as
+    /// `update_trace_gate_decision_perplexity` does and for the same reason.
+    async fn update_trace_gate_decision_author_perplexity(
+        &self,
+        _tenant_id: &str,
+        _submission_id: Uuid,
+        _columns: [Option<i64>; 5],
+    ) -> Result<(), DatabaseError> {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "update_trace_gate_decision_author_perplexity called on a backend without a real impl"
+            );
+        });
+        Ok(())
+    }
+
     /// Update ONLY the credit-quality columns for the decision row identified by
     /// `(tenant_id, decision_id)`. Perplexity, novelty, tail-fraction, vector,
     /// gate status, and credit are left untouched. Implementations MUST scope by
@@ -3311,6 +3409,32 @@ pub trait TraceCorpusStore: Send + Sync {
         _exclude_submission_id: Uuid,
     ) -> Result<Option<TraceGateDecisionRow>, DatabaseError> {
         Ok(None)
+    }
+
+    /// For each of `submission_ids` that has at least one gate decision
+    /// under `tenant_id`, return the credit-bearing slice of its LATEST
+    /// decision (by `decided_at`, then `decision_id`). Ids with no decision
+    /// yet are simply absent: the contributor status surface reads that
+    /// absence as "not scored yet" and keeps showing the submit-time
+    /// estimate.
+    ///
+    /// Tenant-scoped through the forced-RLS trace pool, not the cross-tenant
+    /// gate-driver pool: the two columns this read needs beyond the
+    /// attestation surface (`credit_quality_calibration_version`,
+    /// `credit_withheld_reason`) are not in the gate-driver role's
+    /// column grants, and the callers already hold an authenticated tenant
+    /// context. Callers pass only ids the requesting principal can already
+    /// see; the id list narrows, it never widens.
+    ///
+    /// Default: empty (test doubles / backends without the decision table),
+    /// which degrades to the preliminary estimate rather than failing the
+    /// status read.
+    async fn list_latest_gate_credit_decisions(
+        &self,
+        _tenant_id: &str,
+        _submission_ids: &[Uuid],
+    ) -> Result<Vec<TraceGateCreditDecisionRow>, DatabaseError> {
+        Ok(Vec::new())
     }
 
     /// Paginated scan over `trace_gate_decisions` for the replay binary.

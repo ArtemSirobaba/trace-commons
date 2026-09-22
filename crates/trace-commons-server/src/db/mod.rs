@@ -184,6 +184,66 @@ impl Drop for CreditSettlementAdvisoryLock {
 
 #[async_trait]
 pub trait Database: TraceCorpusStore + Send + Sync {
+    async fn get_reward_offer(
+        &self,
+        _program: uuid::Uuid,
+    ) -> Result<crate::reward_participant::RewardOffer, crate::mission_rewards::RewardError> {
+        Err(crate::mission_rewards::RewardError::StoreUnavailable)
+    }
+
+    async fn get_mission_publication(
+        &self,
+        _mission: uuid::Uuid,
+    ) -> Result<
+        trace_commons_protocol::mission_catalog::MissionPublication,
+        crate::mission_rewards::RewardError,
+    > {
+        Err(crate::mission_rewards::RewardError::StoreUnavailable)
+    }
+
+    async fn list_mission_catalog(
+        &self,
+        _query: &trace_commons_protocol::mission_catalog::MissionCatalogQuery,
+    ) -> Result<
+        trace_commons_protocol::mission_catalog::MissionCatalogPage,
+        crate::mission_rewards::RewardError,
+    > {
+        Err(crate::mission_rewards::RewardError::StoreUnavailable)
+    }
+
+    async fn reserve_reward_offer(
+        &self,
+        _tenant: &str,
+        _account: uuid::Uuid,
+        _program: uuid::Uuid,
+        _request: &crate::reward_participant::RewardReservationRequest,
+    ) -> Result<crate::reward_participant::RewardReservation, crate::mission_rewards::RewardError>
+    {
+        Err(crate::mission_rewards::RewardError::StoreUnavailable)
+    }
+
+    async fn get_reward_reservation(
+        &self,
+        _tenant: &str,
+        _account: uuid::Uuid,
+        _reservation: uuid::Uuid,
+    ) -> Result<crate::reward_participant::RewardReservation, crate::mission_rewards::RewardError>
+    {
+        Err(crate::mission_rewards::RewardError::StoreUnavailable)
+    }
+
+    async fn get_reward_history(
+        &self,
+        _tenant: &str,
+        _account: uuid::Uuid,
+        _query: &crate::reward_participant::RewardHistoryQuery,
+    ) -> Result<
+        crate::reward_participant::RewardParticipantHistory,
+        crate::mission_rewards::RewardError,
+    > {
+        Err(crate::mission_rewards::RewardError::StoreUnavailable)
+    }
+
     async fn get_near_provisioned_anchor(
         &self,
         _tenant_id: &str,
@@ -1479,6 +1539,20 @@ pub trait Database: TraceCorpusStore + Send + Sync {
         &self,
         _limit: i64,
     ) -> Result<Vec<crate::trace_corpus_storage::DedupSignalRow>, DatabaseError> {
+        Ok(Vec::new())
+    }
+
+    /// Enumerate every decision row for the dedup re-derivation pass,
+    /// cross-tenant, ordered `decided_at ASC, decision_id ASC`, capped at
+    /// `limit`. Not filtered by stamp: the pass reuses rows already on its
+    /// target stamp and derives the rest, which is what makes it resumable.
+    /// Reads through the gate-driver reader pool with NO tenant GUC. Every
+    /// column is granted to `trace_gate_driver` by V45 and V57. Default:
+    /// empty (test doubles / backends without a gate-driver pool).
+    async fn list_dedup_rederive_rows(
+        &self,
+        _limit: i64,
+    ) -> Result<Vec<crate::trace_corpus_storage::DedupRederiveRow>, DatabaseError> {
         Ok(Vec::new())
     }
 
