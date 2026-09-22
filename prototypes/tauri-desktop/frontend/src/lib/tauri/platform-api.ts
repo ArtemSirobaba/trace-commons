@@ -149,10 +149,6 @@ export function quitApp() {
   return invokeTauri<void>("quit_app");
 }
 
-export function updateStatus() {
-  return invokeTauri<unknown>("update_status");
-}
-
 export async function pickDirectory(
   purpose: "repository" | "source_root",
 ): Promise<string> {

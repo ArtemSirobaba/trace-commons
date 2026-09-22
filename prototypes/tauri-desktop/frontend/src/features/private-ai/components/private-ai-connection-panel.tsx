@@ -1,9 +1,9 @@
-import { NativeSelect } from "@/components/ui/native-select";
-import { Button } from "@/components/ui/button";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
+import { Button } from "@/components/ui/button";
+import { NativeSelect } from "@/components/ui/native-select";
 import { FormFieldError } from "../../../components/form-field-error";
-import type { useSettings } from "../../settings/hooks/use-settings";
+import type { useSettings } from "../../settings/public";
 import {
   type PrivateAiProviderValues,
   privateAiProviderSchema,
@@ -72,25 +72,26 @@ export function PrivateAiConnectionPanel({
         })}
       >
         <div className="my-5 flex flex-wrap gap-2">
-          <label>
-            <span className="sr-only">Credential provider</span>
-            <NativeSelect
-              {...form.register("provider")}
-              disabled={privateAi.busy}
-              aria-invalid={Boolean(providerError)}
-              aria-describedby={
-                providerError ? "private-ai-provider-error" : undefined
-              }
-            >
-              <option value="github">GitHub</option>
-              <option value="google">Google</option>
-              <option value="near">NEAR wallet</option>
-            </NativeSelect>
-            <FormFieldError
-              id="private-ai-provider-error"
-              message={providerError}
-            />
+          <label className="sr-only" htmlFor="private-ai-provider">
+            Credential provider
           </label>
+          <NativeSelect
+            id="private-ai-provider"
+            {...form.register("provider")}
+            disabled={privateAi.busy}
+            aria-invalid={Boolean(providerError)}
+            aria-describedby={
+              providerError ? "private-ai-provider-error" : undefined
+            }
+          >
+            <option value="github">GitHub</option>
+            <option value="google">Google</option>
+            <option value="near">NEAR wallet</option>
+          </NativeSelect>
+          <FormFieldError
+            id="private-ai-provider-error"
+            message={providerError}
+          />
           <PrivateAiCredentialAction privateAi={privateAi} form={form} />
         </div>
       </form>

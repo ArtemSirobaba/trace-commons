@@ -1,6 +1,6 @@
 import { PageHeader } from "../../components/page-header";
 import { StatCard } from "../../components/stat-card";
-import { useSettings } from "../settings/hooks/use-settings";
+import { useSettings } from "../settings/public";
 import { HarnessListPanel } from "./components/harness-list";
 import { PrivateAiBalancePanel } from "./components/private-ai-balance-panel";
 import { PrivateAiConnectionPanel } from "./components/private-ai-connection-panel";

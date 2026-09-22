@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { coreKeys } from "../../../lib/tauri/query-keys";
 import { useCoreStatus } from "../../../lib/tauri/use-core-status";
-import { settingsKeys } from "../../settings/api/query-keys";
+import { settingsKeys } from "../../settings/public";
 import {
   answerPrivateInferenceOffer,
   getPrivateInferenceOfferState,

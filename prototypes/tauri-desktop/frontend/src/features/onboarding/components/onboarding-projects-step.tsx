@@ -1,5 +1,5 @@
 import { Button } from "@/components/ui/button";
-import { ProjectsPanel } from "../../settings/components/projects-panel";
+import { ProjectsPanel } from "../../settings/public";
 import type { OnboardingStepProps } from "./onboarding-step-types";
 
 export function OnboardingProjectsStep({

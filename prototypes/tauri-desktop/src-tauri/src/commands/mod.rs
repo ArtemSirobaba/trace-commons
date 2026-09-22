@@ -18,6 +18,7 @@ pub(crate) fn handler<R: tauri::Runtime>()
     tauri::generate_handler![
         daemon::core_status,
         daemon::queue_outcome_line,
+        daemon::attestation_copy,
         daemon::daemon_call,
         daemon::preview_entry,
         daemon::dismiss_entry,
@@ -74,9 +75,6 @@ pub(crate) fn handler<R: tauri::Runtime>()
         platform::notification_permission,
         platform::request_notification_permission,
         platform::set_start_at_login,
-        platform::update_status,
-        platform::check_for_update,
-        platform::apply_update,
         platform::open_system_settings,
         platform::quit_app,
         private_ai::cancel_private_ai_credential,

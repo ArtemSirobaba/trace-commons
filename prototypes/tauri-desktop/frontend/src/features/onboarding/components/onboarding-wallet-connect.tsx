@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Field,
@@ -7,23 +6,17 @@ import {
   FieldLabel,
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { useOnboardingWallet } from "../hooks/use-onboarding-wallet";
+import type { useOnboardingWallet } from "../hooks/use-onboarding-wallet";
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: This component renders the Rust-owned wallet lifecycle states and controls.
 export function OnboardingWalletConnect({
-  onEnrolled,
-  onBusyChanged,
+  wallet,
   blocked = false,
 }: {
-  onEnrolled: () => void;
-  onBusyChanged?: (busy: boolean) => void;
+  wallet: ReturnType<typeof useOnboardingWallet>;
   blocked?: boolean;
 }) {
-  const wallet = useOnboardingWallet(onEnrolled);
   const flow = wallet.flow;
-  useEffect(() => {
-    onBusyChanged?.(wallet.pending);
-  }, [onBusyChanged, wallet.pending]);
   if (!flow || flow.state === "Unsupported") return null;
 
   return (

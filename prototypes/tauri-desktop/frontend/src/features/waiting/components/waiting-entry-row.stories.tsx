@@ -21,6 +21,12 @@ const readyEntry = {
   subagents_dropped: 0,
   holds_certificate: true,
   attestation: "attested" as const,
+  attestation_copy: {
+    state_line:
+      "This session carries a checkable copy of the model call it came from.",
+    reason_line: null,
+    tone: "clear" as const,
+  },
 };
 
 export const Ready: Story = {

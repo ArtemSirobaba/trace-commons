@@ -56,7 +56,10 @@ pub(crate) fn open_native_wallet_url(url: String, commons: String) -> Result<(),
 }
 
 #[tauri::command]
-pub(crate) fn platform_capabilities<R: Runtime>(app: AppHandle<R>) -> serde_json::Value {
+pub(crate) fn platform_capabilities<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> serde_json::Value {
     serde_json::json!({
         "schema_version": "trace_commons.platform.v1",
         "os": std::env::consts::OS,
@@ -70,7 +73,7 @@ pub(crate) fn platform_capabilities<R: Runtime>(app: AppHandle<R>) -> serde_json
         "notifications": crate::native::notification_capability(),
         "updates": update_state(),
         "deep_links": {
-            "state": if app.config().bundle.active { "configured" } else { "unknown" },
+            "state": state.inner().deep_link_state(),
             "scheme": "tracecommons",
         },
         "tray": { "state": "available" },
@@ -125,21 +128,6 @@ fn installed_by_homebrew(path: &Path) -> bool {
                     ] if *parent == OsStr::new("Caskroom") && *cask == OsStr::new("trace-commons")
             )
         })
-}
-
-#[tauri::command]
-pub(crate) fn update_status() -> serde_json::Value {
-    update_state()
-}
-
-#[tauri::command]
-pub(crate) fn check_for_update() -> serde_json::Value {
-    update_state()
-}
-
-#[tauri::command]
-pub(crate) fn apply_update() -> serde_json::Value {
-    update_state()
 }
 
 #[tauri::command]

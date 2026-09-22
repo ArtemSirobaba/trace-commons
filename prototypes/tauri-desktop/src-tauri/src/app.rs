@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use anyhow::Context;
 use serde_json::Value;
 use tauri::{Emitter, Manager};
-use trace_commons_contributor::daemon::ipc::{EVENT_DIGEST_DUE, Event};
+use trace_commons_contributor::daemon::ipc::{
+    EVENT_DIGEST_DUE, EVENT_PREVIEW_READY, EVENT_QUEUE_CHANGED, EVENT_RESYNC_REQUIRED,
+    EVENT_SNAPSHOT, EVENT_STATUS_CHANGED, Event,
+};
 
 use crate::{
     commands,
@@ -168,10 +171,19 @@ fn schedule_digest_notification(app: &tauri::AppHandle, event: Event) {
 }
 
 fn handle_daemon_event(app: &tauri::AppHandle, event: Event) {
-    // Event payloads can contain queue snapshots. The webview only needs an
-    // invalidation signal; never forward daemon data, paths, or digest text
-    // through the frontend event channel.
-    let _ = app.emit("daemon-event", serde_json::json!({ "event": event.event }));
+    // Event payloads can contain queue snapshots. The webview receives only
+    // allowlisted invalidation names; never forward daemon data, paths, or
+    // digest text through the frontend event channel.
+    if matches!(
+        event.event.as_str(),
+        EVENT_SNAPSHOT
+            | EVENT_QUEUE_CHANGED
+            | EVENT_STATUS_CHANGED
+            | EVENT_RESYNC_REQUIRED
+            | EVENT_PREVIEW_READY
+    ) {
+        let _ = app.emit("daemon-event", serde_json::json!({ "event": event.event }));
+    }
     if event.event != EVENT_DIGEST_DUE {
         return;
     }
@@ -216,9 +228,30 @@ fn start_event_bridge(app: tauri::AppHandle) {
     }
 }
 
+fn remember_deep_link(app: &tauri::AppHandle, value: &str) {
+    if platform::is_tracecommons_deep_link(value) {
+        app.state::<AppState>()
+            .set_pending_deep_link(value.to_owned());
+        let _ = app.emit("deep-link-received", ());
+    }
+}
+
 pub(crate) fn run() {
-    tauri::Builder::default()
-        .manage(AppState::default())
+    let builder = tauri::Builder::default().manage(AppState::default());
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    let builder = builder
+        // Windows and Linux deliver protocol activations to a new process.
+        // Register this before deep-link handling so the first process owns
+        // all subsequent activations.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            for argument in argv {
+                remember_deep_link(app, &argument);
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init());
+
+    builder
         .setup(|app| {
             let state_dir = app
                 .path()
@@ -230,10 +263,34 @@ pub(crate) fn run() {
                 .install(runtime)
                 .map_err(|_| "application state lock poisoned")?;
             for argument in std::env::args().skip(1) {
-                if platform::is_tracecommons_deep_link(&argument) {
-                    state.set_pending_deep_link(argument);
-                }
+                remember_deep_link(app.handle(), &argument);
             }
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+
+                // Runtime registration makes debug and unpackaged builds
+                // usable. Packaged macOS registration comes from the bundle
+                // configuration above.
+                let state = if app.deep_link().register_all().is_ok() {
+                    "configured"
+                } else {
+                    "unavailable"
+                };
+                app.state::<AppState>().set_deep_link_state(state);
+            }
+            #[cfg(target_os = "macos")]
+            app.state::<AppState>().set_deep_link_state(if app.config().bundle.active {
+                "configured"
+            } else {
+                "unknown"
+            });
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "linux"
+            )))]
+            app.state::<AppState>().set_deep_link_state("unavailable");
             native::configure_notifications();
             tray::setup_tray(app)?;
             start_event_bridge(app.handle().clone());
@@ -246,12 +303,7 @@ pub(crate) fn run() {
         .run(|app_handle, event| match event {
             tauri::RunEvent::Opened { urls } => {
                 for url in urls {
-                    let value = url.as_str();
-                    if platform::is_tracecommons_deep_link(value) {
-                        app_handle
-                            .state::<AppState>()
-                            .set_pending_deep_link(value.to_owned());
-                    }
+                    remember_deep_link(app_handle, url.as_str());
                 }
             }
             tauri::RunEvent::ExitRequested { api, code, .. } => {

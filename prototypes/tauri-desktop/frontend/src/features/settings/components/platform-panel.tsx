@@ -125,7 +125,7 @@ export function PlatformPanel() {
           />
           <CapabilityRow
             label="Updates"
-            detail={`${data.updates.owner} owns replacement; this build does not fetch or replace itself.`}
+            detail={`${data.updates.owner} owns replacement: ${data.updates.action}. This build does not fetch or replace itself.`}
             state={data.updates.state}
           />
           <CapabilityRow

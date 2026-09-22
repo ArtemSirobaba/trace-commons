@@ -1,10 +1,10 @@
-import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useEffect, useMemo } from "react";
 import { useController, useForm } from "react-hook-form";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { FormFieldError } from "../../../components/form-field-error";
-import type { ConsentOption } from "../../onboarding/types";
+import type { ConsentOption } from "../../onboarding/public";
 import {
   type ConsentSettingsFormValues,
   consentSettingsFormSchema,
@@ -121,9 +121,11 @@ export function ConsentSettingsPanel({
                 return (
                   <label
                     className="flex items-start gap-2.5 border-b border-border py-3 text-[12px] font-normal text-foreground"
+                    htmlFor={`settings-consent-${option.name}`}
                     key={option.name}
                   >
                     <Checkbox
+                      id={`settings-consent-${option.name}`}
                       checked={checked || option.always_on}
                       disabled={busy || option.always_on}
                       onCheckedChange={() => toggle(option.name)}

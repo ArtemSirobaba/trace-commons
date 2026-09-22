@@ -19,18 +19,29 @@ The frontend never imports Rust crates or reaches into daemon state. It calls a 
 | Window, tray, native lifecycle | Tauri/Rust shell | Tauri commands and events |
 | Navigation composition | `src/app` | Route IDs and public feature entries |
 | Profile UI/draft and navbar identity | `src/features/profile` + `src/app` composition | `ProfilePage` public entry; app shell owns shared profile read |
-| Rust status transport | `src/lib/tauri` | Parsed `CoreStatus` |
+| Rust status and event transport | `src/lib/tauri/core-api.ts` via `@tauri-apps/api/core` and `@tauri-apps/api/event` | Official Tauri invoke/listen APIs, browser-preview fallback only for core status, normalized command errors |
 | Enrollment flows | `src/features/onboarding` + `src-tauri/src/commands/native_flows.rs` | Invite, deep-link, NEAR AI, and NEAR wallet commands |
 | Queue grouping/approval/undo, certificate and attestation facts, history grouping/credit record/detail/withdrawal/community rollup/public-run publication, accepted-session skill learning/install, project policy, consent, local audit, privacy, witness, behavior guardrails, routing, daemon, Insights, mission drafts, compute | `trace-commons-contributor` | Existing Rust API and local stores |
 | Admission, witness preview, and queue outcomes | `src/features/waiting` + `src-tauri/src/commands/native_flows.rs` | Explicit review actions, daemon-owned refusal views, read-only outcome counts |
-| Deep-link intake and browser safety | `src-tauri/src/commands/platform.rs` | Rust validation, pending cold-start/while-running delivery, same-origin wallet opening |
+| Deep-link intake and browser safety | Tauri deep-link/single-instance plugins + `src-tauri/src/commands/platform.rs` | Rust validation, pending cold-start/while-running delivery, same-origin wallet opening |
 | Keychain, notifications, login item, tray state, updates, signing | `src-tauri/src/native.rs`, `src-tauri/native_macos.m`, `src-tauri/src/commands/platform.rs`, `src-tauri/src/tray.rs`, release script | Explicit Tauri commands/events and per-OS adapters; no platform policy in React |
 
 ## Rules
 
 - One feature owns its page, workflow hook, components, types, and stories.
+- `src/app` composes pages through feature entries; the shell owns shared
+  status, navigation, and onboarding guards.
+- Cross-feature dependencies use the owning feature's `public.ts` surface;
+  feature internals stay private.
 - Shared code stays domain-free; it cannot import features.
 - Untrusted command results are parsed at the UI/Rust command boundary.
+- React derives render state directly; effects are reserved for external
+  subscriptions, native lifecycles, and server-to-pristine-form synchronization.
+  Feature hooks own workflow state; their UI components receive controllers and
+  render state rather than mirroring it back through callbacks.
+- Frontend transport uses official `@tauri-apps/api` bundler imports. The
+  `window.__TAURI__` global is not exposed; feature API modules own command
+  names and runtime response parsing.
 - Read-only daemon IPC stays allowlisted. Mutations use named Tauri commands; no generic write bridge exists.
 - Profile draft state is local React state, hydrates once from the Rust-owned public profile, and uses an explicit acknowledgement modal before first publication; publish/withdraw calls use explicit Rust commands. Onboarding scrubber disclosures read detector names from a named Rust command; TypeScript never copies privacy-detector policy.
 - No frontend code depends on AGPL server or gate crates; the Tauri shell uses permissive contributor/protocol crates only.
@@ -41,8 +52,10 @@ The frontend never imports Rust crates or reaches into daemon state. It calls a 
 - Native wallet browser opening is a separate Rust command limited to the exact HTTPS origin returned by the enrolled commons. Wallet lifecycle state never crosses through a generic write bridge.
 - `consume_deep_link` accepts only validated enrollment, credential-provider,
   and public-run shapes. Invalid payloads are consumed and rejected before
-  React navigation. Credential callbacks carry provider identity only; they
-  never carry a code, token, or secret.
+  React navigation. Rust stores cold-start links and emits a payload-free
+  `deep-link-received` signal for live links; the app subscribes before its
+  one-time pending-link read. Credential callbacks carry provider identity
+  only; they never carry a code, token, or secret.
 - NEAR AI enrollment, admission preparation, and witness review use named commands. Rust supplies fixed status/refusal views; React never maps daemon control labels into user copy.
 - Queue outcome disclosure calls read-only `queue_outcome_counts` plus Rust-owned `queue_outcome_line`; it states that entries discarded before queue creation are outside this count.
 - Local audit is visibility-only: Rust supplies newest-first fixed labels; React does not authorize, block, or enrich entries.
@@ -52,6 +65,12 @@ The frontend never imports Rust crates or reaches into daemon state. It calls a 
 - Status-derived queue and community panels render only daemon-provided facts; unavailable routing, budget, and standing values stay unavailable.
 - Daemon events cross into React as allowlisted event names only. Event bodies,
   paths, transcript text, and credentials never cross the event bridge.
+- Frontend daemon-event invalidation follows ownership: queue changes refresh
+  waiting data and core status; preview readiness refreshes waiting data;
+  status changes refresh account-scoped data and core status; snapshots and
+  resync requests refresh the account scope. `digest_due` remains Rust-owned.
+- `useDesktopEvents` owns native event subscriptions and one initial pending-link
+  read; onboarding completion storage stays in the onboarding feature.
 - Native notification actions have Review and Not now only. Review foregrounds
   the app; the app remains responsible for its normal waiting route.
 - Native Swift, WinUI, and GTK remain reference implementations during migration.
@@ -72,27 +91,39 @@ Bounded queue transcript paging, turn indexing, and original-session match count
 
 ### Phase 4 — contributor workflows
 
-Native-ordered onboarding (source roots, invite/deep-link intake, invite enrollment, NEAR AI enrollment, NEAR wallet ceremony, consent second, optional third-party scan disclosure, project policy, done), tenant-scoped completion state, source-root declarations, project policy, consent editing, local audit visibility, witness trust configuration, behavior guardrails, optional privacy-evidence/token-review controls, private-AI browser credential lifecycle, account-balance display, verified funding destination, configured-tool inventory, routing discovery/configuration/probes, bounded queue transcript/turn inspection, original-session match counts, explicit admission preparation, explicit witness preview review, queue outcome disclosure, private-inference queue offer, community history standing, reviewed public-run create/edit/unpublish, accepted-session skill learning/evaluation/install/rollback, and plan-before-commit harness writes are wired as separate vertical slices. Tray menu/icon, Rust-owned native folder picking, local Git evidence linking, bounded test-report linking, selected macOS notification/login-item flows, digest routing, and quit interception are also source-wired. Windows/Linux adapters, updater ownership, deep certificate review, native file grants, keychain lifecycle proof, packaging/signing, and remaining account flows stay phase-gated.
+Native-ordered onboarding (source roots, invite/deep-link intake, invite enrollment, NEAR AI enrollment, NEAR wallet ceremony, consent second, optional third-party scan disclosure, project policy, done), tenant-scoped completion state, source-root declarations, project policy, consent editing, local audit visibility, witness trust configuration, behavior guardrails, optional privacy-evidence/token-review controls, private-AI browser credential lifecycle, account-balance display, verified funding destination, configured-tool inventory, routing discovery/configuration/probes, bounded queue transcript/turn inspection, original-session match counts, explicit admission preparation, explicit witness preview review, queue outcome disclosure, private-inference queue offer, community history standing, reviewed public-run create/edit/unpublish, accepted-session skill learning/evaluation/install/rollback, and plan-before-commit harness writes are wired as separate vertical slices. Tray menu/icon, Rust-owned native folder picking, local Git evidence linking, bounded test-report linking, selected macOS notification/login-item flows, digest routing, quit interception, and cross-platform protocol intake are also source-wired. Windows/Linux native notification, startup, tray, credential, file-grant, and packaging adapters remain phase-gated because they need OS evidence, not frontend-only substitutes.
 
 ### macOS parity matrix for current shell
 
 | macOS reference flow | Tauri implementation | Current proof boundary |
 | --- | --- | --- |
 | Invite paste, issuer preview, and enrollment | `InviteConnectForm`, `enroll_with_invite` | TypeScript compile/build; daemon-backed call is source-wired |
-| `tracecommons://enroll` from cold start or running app | `consume_deep_link`, pending app state, `AppShell` polling | Rust parser tests; OS scheme registration still unproved |
+| `tracecommons://enroll` from cold start or running app | `consume_deep_link`, pending app state, `useDesktopEvents`, Tauri deep-link + single-instance plugins | Source-wired for macOS bundle and Windows/Linux runtime registration; packaged OS callback smoke still unproved |
 | Existing NEAR AI login enrollment | `OnboardingNearAiJoin`, `near_ai_account_enroll` | Named command and fixed UI states; live provider enrollment unproved |
 | NEAR wallet capability/start/wait/cancel | `OnboardingWalletConnect`, `native_wallet_flow`, same-origin URL command | Rust lifecycle/URL tests; wallet completion unproved |
 | Queue “not offered” reasons | `queue_outcome_counts`, `QueueOutcomeDisclosure` | Read-only parser/build; pre-queue discard reasons remain outside daemon contract |
 | Admission preparation | `AdmissionPreparationOverlay`, `prepare_admission_session` | Rust-owned readiness/refusal view; live commons evidence unproved |
 | Explicit witness preview review | `WitnessReviewOverlay`, `witness_preview_support`, `witness_preview_request` | Rust-owned support/refusal view; pinned witness availability unproved |
-| Certificate/attestation detail | Existing `CertificatePanel` plus history facts | Summary facts only; full certificate review remains Phase 5F |
+| Certificate/attestation detail | `CertificatePanel` plus bounded `certificate_detail` review overlay | Additive Tauri review surface; not a native-parity acceptance gate. Native file-grant lifecycle remains Phase 5F |
 | Notifications and login item | macOS Objective-C bridge in `native_macos.m`; typed capability/request commands; Review opens `tracecommons://review` | Source/build hook only; permission, relaunch, action, and external-disablement smoke pending |
 | Tray/menu/flyout | Daemon-derived counts, project summaries, pause/resume, private-inference stop, weekly rollup, Review/Open/Settings/Quit | Rust compile only; native menu-bar smoke pending |
 | Credential/keychain status | Daemon-owned OS-secret lifecycle plus redacted Tauri status (`state`, prefix, expiry, migration) | Source/build only; OS backend, migration, wipe, and crash/restart proof pending |
-| Credential/public-run/review deep links | Rust validation plus cold-start/while-running delivery; provider-only credential route; notification Review route | Parser tests only; packaged scheme registration and callback smoke pending |
-| Updates | Homebrew-aware installer-owned contract; unmanaged installs remain explicit; no self-replacement | No self-update feed/plugin; ownership decision required before adding updater dependency |
+| Credential/public-run/review deep links | Rust validation plus cold-start/while-running delivery; provider-only credential route; notification Review route | Parser tests plus plugin source wiring; packaged scheme registration and callback smoke pending |
+| Updates | Homebrew-aware installer-owned status; unmanaged installs remain explicit; no self-replacement | No self-update feed/plugin; installer/deployment owner must provide feed and quiesce contract before any updater is added |
 | Signed packaging | Universal Darwin bundle build, ad-hoc signature verification, release config, and sign/notarize/staple/hash script | Developer ID signature, notarization credentials, stapling, Gatekeeper, and clean-machine smoke |
-| Certificate/attestation detail and file grants | Existing summary UI and Rust path validation | Full certificate review, bookmarks, portal grants remain Phase 5F |
+| Certificate/attestation detail and file grants | Rust-owned certificate claims, signer/measurement/receipt detail, attestation copy/tone/reason, and Rust path validation | Bookmarks, portal grants, and native permission lifecycle remain Phase 5F |
+
+### Platform handoff ledger
+
+Only surfaces already present in native applications are in scope. Tauri owns
+shared flow/state; OS-specific work remains a thin adapter or packaging task.
+
+| Surface | macOS | Windows | Linux |
+| --- | --- | --- | --- |
+| Enrollment, credential, public-run, and Review links | Bundle scheme configuration; pending-state delivery | Runtime scheme registration plus single-instance forwarding | Runtime scheme registration plus single-instance forwarding |
+| Notifications, startup, tray | Source-wired adapter; permission and relaunch smoke pending | Existing WinUI behavior is reference; Tauri adapter and package smoke pending | Existing GTK behavior is reference; portal/autostart smoke pending |
+| Credentials and file access | Keychain/bookmark lifecycle smoke pending | Credential Manager/picker lifecycle smoke pending | Secret service/portal-grant lifecycle smoke pending |
+| Updates and packaging | Homebrew/installer ownership; universal signing/notarization pending | MSIX/App Installer owner and quiesce contract pending | Flatpak portal owner pending; source builds stay installer-owned |
 
 ### Phase 5 — native parity and release
 
@@ -122,6 +153,9 @@ The current slice is complete when these facts hold:
 - Existing Swift, WinUI, GTK, AGPL server, and gate crates remain untouched by
   this slice. The only shared Rust change is the permissive contributor
   re-export of scrubber names used by the Tauri disclosure.
+- Waiting renders the daemon's attestation mark through the shared Rust copy
+  tables, including unknown-state and reason handling. A missing or future
+  label never becomes an unattested or verified claim.
 
 ## Remaining work, phase by phase
 
@@ -142,9 +176,10 @@ Required command boundaries:
   permission, update ownership, deep-link support, and tray availability.
 - `set_start_at_login`: user-requested enable/disable, with read-back state.
 - `notification_permission` and `request_notification_permission`.
-- `update_status`, `check_for_update`, and `apply_update`: Homebrew-managed and
-  installer-owned `unmanaged` responses are implemented. Self-update and daemon
-  quiesce remain intentionally unavailable until update ownership is approved.
+- `platform_capabilities`: update ownership and installer action are
+  informational. Dead `update_status`, `check_for_update`, and `apply_update`
+  commands were removed; self-update and daemon quiesce remain unavailable
+  until a real feed owner and release contract exist.
 - `consume_deep_link`: enrollment, provider-only credential, and public-run
   routes are implemented through the same Rust validation boundary.
 
@@ -218,9 +253,9 @@ No credential is placed in localStorage, Storybook fixtures, tray labels,
 
 ### Phase 5E — update ownership and release packaging
 
-Status: Homebrew-aware installer-owned update contract and universal macOS
-release path are source-wired; self-update and full release acceptance remain
-open.
+Status: Homebrew-aware installer-owned update contract, universal macOS release
+path, and cross-platform deep-link registration are source-wired; self-update
+and full release acceptance remain open.
 
 Keep replacement authority with the installer/deployment system:
 
@@ -248,16 +283,21 @@ and restart into the new version.
 
 ### Phase 5F — deep native integrations
 
-Status: credential/public-run/review route validation is implemented. Full
-certificate/attestation detail and native file-grant lifecycle remain open.
+Status: credential/public-run/review route validation, shared attestation
+state/reason rendering, and bounded certificate detail are implemented. Native
+file-grant lifecycle remains open.
 
-- Certificate/attestation: show the full certificate, signer, measurement
-  trust, receipt, expiry, and refusal reason. Do not collapse attestation into
-  a generic "verified" badge.
+- Certificate/attestation: Tauri `certificate_detail` exposes bounded
+  signed claims, recovered signer, measurement, receipt state, signature and
+  admission presence, issued time, and explicit no-expiry state. Raw envelope,
+  signature, and certificate JSON remain withheld. Do not collapse attestation
+  into a generic "verified" badge; legacy reviews keep receipt state unknown.
+  This is an additive Tauri review surface, not a claim that every legacy shell
+  has the same detail view.
 - Deep links: enrollment invites, provider-only credential routes, public-run
-  routes, and the notification Review route are wired through
-  `consume_deep_link`; malformed or unexpected payloads are rejected before UI
-  navigation.
+  routes, and the notification Review route are wired through the Tauri
+  deep-link/single-instance plugins and `consume_deep_link`; malformed or
+  unexpected payloads are rejected before UI navigation.
 - Native file access: retain Rust validation for every selected path. Add
   security-scoped bookmarks on macOS, Windows picker permission handling, and
   Flatpak portal grants where packaging requires them.
@@ -267,9 +307,10 @@ certificate/attestation detail and native file-grant lifecycle remain open.
 
 ### Phase 5G — UI parity and accessibility
 
-Status: platform settings and quit confirmation use existing shadcn primitives
-and desktop modal/mobile drawer behavior. Full native visual and accessibility
-audit remains open.
+Status: platform settings, quit confirmation, source-root labels, OpenCode
+status, and waiting certificate caching use existing shadcn/query primitives;
+desktop modal/mobile drawer behavior remains intact. Full native visual and
+accessibility audit remains open.
 
 Bring parity beyond route availability:
 
@@ -295,7 +336,8 @@ Run evidence in layers:
 
 1. Source: TypeScript build, Storybook build, Rust check/test, format check,
    license-boundary test, and dependency-license checks when dependencies
-   change. Current dependency set adds no Tauri plugin.
+   change. Tauri deep-link and single-instance plugins are now explicit desktop
+   dependencies; run dependency/license checks before release.
 2. Tauri: launch, command bridge, clean shutdown, no residual daemon/lock,
    fresh app-data store, migrated app-data store, and account-free routes.
 3. OS: signed/package smoke on macOS, Windows, and Linux; picker,
@@ -334,9 +376,9 @@ notary API-key values, and the Tauri 2 CLI (the script falls back to
   contributor daemon and account-free Insights use local state.
 - No generic frontend-to-daemon write bridge. New mutations require a named
   Tauri command with Rust validation.
-- No new Tauri plugins or runtime dependencies were added. Native picker uses
-  fixed OS picker commands behind Rust validation; unavailable platform tools
-  return a fixed error.
+- Tauri deep-link and single-instance plugins are limited to macOS, Windows,
+  and Linux desktop targets. Native picker still uses fixed OS picker commands
+  behind Rust validation; unavailable platform tools return a fixed error.
 - No claim of signed-package, notification, login-item, keychain, updater,
   provider-enrollment, or cross-OS runtime parity follows from local builds.
   Source wiring for selected macOS adapters does not satisfy those runtime

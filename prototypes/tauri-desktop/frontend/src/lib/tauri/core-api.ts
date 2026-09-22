@@ -1,23 +1,23 @@
+import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { CoreStatus } from "./types";
 
-type TauriWindow = Window & {
-  __TAURI__?: {
-    core: {
-      invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
-    };
-    event?: {
-      listen<T>(
-        event: string,
-        handler: (event: { payload: T }) => void,
-      ): Promise<() => void>;
-    };
-  };
-};
-
 function tauriInvoke<T>(command: string, args: Record<string, unknown> = {}) {
-  const invoke = (window as TauriWindow).__TAURI__?.core.invoke<T>;
-  if (!invoke) throw new Error("Rust core is available only inside Tauri");
-  return invoke(command, args);
+  if (!isTauri()) throw new Error("Rust core is available only inside Tauri");
+  return invoke<T>(command, args).catch((error: unknown) => {
+    throw normalizeInvokeError(error);
+  });
+}
+
+function normalizeInvokeError(error: unknown): Error {
+  if (error instanceof Error) return error;
+  if (typeof error === "string" && error.trim() !== "") {
+    return new Error(error);
+  }
+  if (isRecord(error) && typeof error.message === "string") {
+    return new Error(error.message);
+  }
+  return new Error("Rust command failed");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,8 +54,7 @@ function parseCoreStatus(value: unknown): CoreStatus {
 }
 
 export async function getCoreStatus(): Promise<CoreStatus> {
-  const invoke = (window as TauriWindow).__TAURI__?.core.invoke<unknown>;
-  if (!invoke) {
+  if (!isTauri()) {
     return {
       prototype: true,
       state_dir: "browser-preview",
@@ -70,7 +69,11 @@ export async function getCoreStatus(): Promise<CoreStatus> {
       },
     };
   }
-  return parseCoreStatus(await invoke("core_status"));
+  return parseCoreStatus(await tauriInvoke<unknown>("core_status"));
+}
+
+export function isTauriRuntime() {
+  return isTauri();
 }
 
 export async function daemonCall<T>(
@@ -91,7 +94,6 @@ export async function listenTauri<T>(
   event: string,
   handler: (payload: T) => void,
 ): Promise<() => void> {
-  const tauri = (window as TauriWindow).__TAURI__;
-  if (!tauri?.event) return () => {};
-  return tauri.event.listen<T>(event, ({ payload }) => handler(payload));
+  if (!isTauri()) return () => {};
+  return listen<T>(event, ({ payload }) => handler(payload));
 }

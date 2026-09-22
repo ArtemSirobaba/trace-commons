@@ -1,13 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { coreKeys } from "../../../lib/tauri/query-keys";
 import { useCoreStatus } from "../../../lib/tauri/use-core-status";
+import type { ConsentOption } from "../../onboarding/public";
 import {
   getConsentOptions,
+  onboardingKeys,
   setConsentScopes,
-} from "../../onboarding/api/onboarding-api";
-import { onboardingKeys } from "../../onboarding/api/query-keys";
-import type { ConsentOption } from "../../onboarding/types";
-import { profileKeys } from "../../profile/api/query-keys";
+} from "../../onboarding/public";
+import { profileKeys } from "../../profile/public";
 import { settingsKeys } from "../api/query-keys";
 
 export function useConsentSettings() {

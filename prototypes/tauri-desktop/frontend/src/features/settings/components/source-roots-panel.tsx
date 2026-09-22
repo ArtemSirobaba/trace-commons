@@ -147,6 +147,7 @@ function SourceRootRow({
         <NativeSelect
           {...form.register("mode")}
           disabled={busy}
+          aria-label={`${label} source mode`}
           aria-invalid={Boolean(form.formState.errors.mode)}
           aria-describedby={
             form.formState.errors.mode ? `${source}-mode-error` : undefined
@@ -158,6 +159,7 @@ function SourceRootRow({
         {modeValue === "watch" && (
           <>
             <label>
+              <span className="sr-only">{label} sessions folder</span>
               <Input
                 {...form.register("path")}
                 placeholder="/absolute/path/to/sessions"

@@ -15,4 +15,6 @@ export const waitingKeys = {
     [...waitingKeys.scope(account), "preview-body", entryId] as const,
   previewTurns: (account: string, entryId: string, digest: string) =>
     [...waitingKeys.scope(account), "preview-turns", entryId, digest] as const,
+  certificateDetail: (account: string, entryId: string) =>
+    [...waitingKeys.scope(account), "certificate-detail", entryId] as const,
 };

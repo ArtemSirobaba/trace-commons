@@ -67,6 +67,7 @@ impl Runtime {
 pub(crate) struct AppState {
     runtime: Mutex<Option<Runtime>>,
     pending_deep_link: Mutex<Option<String>>,
+    deep_link_state: Mutex<String>,
     event_stop: Arc<AtomicBool>,
     exit_authorized: AtomicBool,
 }
@@ -76,6 +77,7 @@ impl Default for AppState {
         Self {
             runtime: Mutex::new(None),
             pending_deep_link: Mutex::new(None),
+            deep_link_state: Mutex::new("unknown".to_owned()),
             event_stop: Arc::new(AtomicBool::new(false)),
             exit_authorized: AtomicBool::new(false),
         }
@@ -286,6 +288,19 @@ impl AppState {
             .lock()
             .ok()
             .and_then(|mut pending| pending.take())
+    }
+
+    pub(crate) fn set_deep_link_state(&self, state: &str) {
+        if let Ok(mut current) = self.deep_link_state.lock() {
+            *current = state.to_owned();
+        }
+    }
+
+    pub(crate) fn deep_link_state(&self) -> String {
+        self.deep_link_state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_else(|_| "unknown".to_owned())
     }
 }
 

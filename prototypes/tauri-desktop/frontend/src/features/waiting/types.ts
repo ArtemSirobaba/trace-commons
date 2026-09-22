@@ -1,3 +1,28 @@
+export type AttestationCopy = {
+  state_line: string;
+  reason_line: string | null;
+  tone: "neutral" | "held" | "clear" | "attention" | "refused";
+};
+
+export type CertificateDetail = {
+  state: "held";
+  verification: "verified_at_review";
+  redacted_sha256: string;
+  residual_risk_verdict: string;
+  redaction_policy_version: string;
+  witness_measurement: string;
+  issued_at: number;
+  expires_at: null;
+  expiry_state: "not_issued";
+  signer: string;
+  signature_present: boolean;
+  admission_evidence_present: boolean;
+  inference_receipt: {
+    state: string;
+    reason: string | null;
+  } | null;
+};
+
 export type WaitingEntry = {
   entry_id: string;
   project_id: string;
@@ -17,6 +42,7 @@ export type WaitingEntry = {
   eligibility_reason?: string | null;
   attestation?: string | null;
   attestation_reason?: string | null;
+  attestation_copy?: AttestationCopy | null;
   holds_certificate?: boolean;
   attested_inference?: { state: string; reason?: string | null } | null;
 };

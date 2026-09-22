@@ -2,8 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { coreKeys } from "../../../lib/tauri/query-keys";
 import { useCoreStatus } from "../../../lib/tauri/use-core-status";
-import { profileKeys } from "../../profile/api/query-keys";
-import { settingsKeys } from "../../settings/api/query-keys";
+import { profileKeys } from "../../profile/public";
+import { settingsKeys } from "../../settings/public";
 import {
   acknowledgeNearAiNotice,
   enrollWithInvite,

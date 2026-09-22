@@ -56,12 +56,14 @@ production macOS, Windows, or GTK app bundles.
 This is source/build plus unsigned universal-Darwin-bundle proof, not signed OS release proof. macOS
 notification permission, login-item control, daemon-derived tray state,
 weekly digest data, quit interception, credential/public-run/review route
-validation, redacted keychain status, and a signed release path are source-wired.
-Homebrew installs report managed updates; other installs report unmanaged
-updates. OS permission/action smoke, self-update feed, deep certificate review,
-native file grants, keychain migration proof, signing/notarization,
-accessibility audit, and cross-platform smoke remain open. No self-update
-dependency is included.
+validation, redacted keychain status, cross-platform deep-link registration,
+and a signed release path are source-wired. Homebrew installs report managed
+updates; other installs report unmanaged updates. OS permission/action smoke,
+self-update feed, packaged deep-link callbacks, native file grants, keychain
+migration proof, signing/notarization, accessibility audit, and cross-platform
+runtime smoke remain open. Dead Tauri updater commands were removed; replacement
+remains installer-owned. The certificate detail overlay is additive and is not
+treated as legacy-shell parity proof.
 Private-AI browser credential start/status/cancel/forget, account-balance
 display, verified funding destination, configured-tool inventory,
 plan-before-commit harness wiring, and the queue's private-inference offer are

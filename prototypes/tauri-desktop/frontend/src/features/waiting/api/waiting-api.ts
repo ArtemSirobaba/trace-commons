@@ -1,5 +1,6 @@
 import { daemonCall, invokeTauri } from "../../../lib/tauri/core-api";
 import type {
+  AttestationCopy,
   ApprovalResult,
   QueueOutcomeCounts,
   WaitingData,
@@ -55,8 +56,53 @@ function numberMap(value: unknown, label: string): Record<string, number> {
   return value as Record<string, number>;
 }
 
-function parseEntry(value: unknown): WaitingEntry {
+function parseAttestationCopy(value: unknown): AttestationCopy {
   const record = asRecord(value);
+  if (
+    typeof record.state_line !== "string" ||
+    (record.reason_line !== null && typeof record.reason_line !== "string") ||
+    !["neutral", "held", "clear", "attention", "refused"].includes(
+      record.tone as string,
+    )
+  ) {
+    throw new Error("Invalid waiting attestation copy");
+  }
+  return record as AttestationCopy;
+}
+
+type AttestationCache = Map<string, Promise<AttestationCopy>>;
+
+function attestationCacheKey(label: string | null, reason: string | null) {
+  return `${label ?? ""}\u0000${reason ?? ""}`;
+}
+
+async function getAttestationCopy(
+  label: string | null,
+  reason: string | null,
+  cache: AttestationCache,
+): Promise<AttestationCopy> {
+  const key = attestationCacheKey(label, reason);
+  const cached = cache.get(key);
+  if (cached) return cached;
+  const request = invokeTauri<unknown>("attestation_copy", {
+    label: label ?? "",
+    reason,
+  }).then(parseAttestationCopy);
+  const retryable = request.catch((error: unknown) => {
+    cache.delete(key);
+    throw error;
+  });
+  cache.set(key, retryable);
+  return retryable;
+}
+
+async function parseEntry(
+  value: unknown,
+  cache: AttestationCache,
+): Promise<WaitingEntry> {
+  const record = asRecord(value);
+  const attestation = optionalString(record, "attestation");
+  const attestationReason = optionalString(record, "attestation_reason");
   return {
     entry_id: asString(record, "entry_id"),
     project_id: asString(record, "project_id"),
@@ -74,8 +120,13 @@ function parseEntry(value: unknown): WaitingEntry {
     attempts: optionalNumber(record, "attempts"),
     eligibility: optionalString(record, "eligibility"),
     eligibility_reason: optionalString(record, "eligibility_reason"),
-    attestation: optionalString(record, "attestation"),
-    attestation_reason: optionalString(record, "attestation_reason"),
+    attestation,
+    attestation_reason: attestationReason,
+    attestation_copy: await getAttestationCopy(
+      attestation,
+      attestationReason,
+      cache,
+    ),
     holds_certificate:
       record.holds_certificate === undefined
         ? undefined
@@ -103,12 +154,17 @@ export async function getWaitingData(): Promise<WaitingData> {
   const response = asRecord(await daemonCall<unknown>("list_pending"));
   if (!Array.isArray(response.pending))
     throw new Error("Invalid waiting response");
-  return { pending: response.pending.map(parseEntry) };
+  const cache: AttestationCache = new Map();
+  return {
+    pending: await Promise.all(
+      response.pending.map((value) => parseEntry(value, cache)),
+    ),
+  };
 }
 
-function parsePreview(value: unknown): WaitingPreview {
+async function parsePreview(value: unknown): Promise<WaitingPreview> {
   const record = asRecord(value);
-  const entry = parseEntry(record.entry);
+  const entry = await parseEntry(record.entry, new Map());
   if (
     typeof record.would_send_bytes !== "number" ||
     typeof record.raw_session_bytes !== "number" ||

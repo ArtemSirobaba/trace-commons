@@ -1,5 +1,5 @@
 import { Button } from "@/components/ui/button";
-import { SourceRootsPanel } from "../../settings/components/source-roots-panel";
+import { SourceRootsPanel } from "../../settings/public";
 import type { OnboardingStepProps } from "./onboarding-step-types";
 
 export function OnboardingRootsStep({

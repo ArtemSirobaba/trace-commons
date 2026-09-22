@@ -19,6 +19,31 @@ pub(crate) fn queue_outcome_line(label: String) -> String {
 }
 
 #[tauri::command]
+pub(crate) fn attestation_copy(label: String, reason: Option<String>) -> serde_json::Value {
+    use trace_commons_contributor::private_inference_copy::{
+        PrivateInferenceTone, attestation_reason_line, attestation_state_line,
+        attestation_state_tone,
+    };
+
+    let reason_line = reason
+        .as_deref()
+        .map(attestation_reason_line)
+        .filter(|line| !line.is_empty());
+    let tone = match attestation_state_tone(&label) {
+        PrivateInferenceTone::Clear => "clear",
+        PrivateInferenceTone::Attention => "attention",
+        PrivateInferenceTone::Held => "held",
+        PrivateInferenceTone::Refused => "refused",
+        PrivateInferenceTone::Neutral => "neutral",
+    };
+    serde_json::json!({
+        "state_line": attestation_state_line(&label),
+        "reason_line": reason_line,
+        "tone": tone,
+    })
+}
+
+#[tauri::command]
 pub(crate) async fn daemon_call(
     state: State<'_, AppState>,
     method: String,

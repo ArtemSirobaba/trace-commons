@@ -1,9 +1,6 @@
-import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { InviteConnectForm } from "./invite-connect-form";
-import { OnboardingNearAiJoin } from "./onboarding-near-ai-join";
+import { OnboardingConnectionOptions } from "./onboarding-connection-options";
 import type { OnboardingStepProps } from "./onboarding-step-types";
-import { OnboardingWalletConnect } from "./onboarding-wallet-connect";
 
 export function OnboardingConnectStep({
   onboarding,
@@ -14,9 +11,6 @@ export function OnboardingConnectStep({
   OnboardingStepProps,
   "onboarding" | "alreadyEnrolled" | "initialInvite" | "busy"
 >) {
-  const [nearAiBusy, setNearAiBusy] = useState(false);
-  const [walletBusy, setWalletBusy] = useState(false);
-  const nativeBusy = nearAiBusy || walletBusy;
   return (
     <section className="mb-4 grid gap-5 rounded-2xl border border-border bg-card/80 p-[26px]">
       <div>
@@ -39,33 +33,11 @@ export function OnboardingConnectStep({
           </Button>
         </div>
       ) : (
-        <>
-          <InviteConnectForm
-            busy={busy || nativeBusy}
-            initialInvite={initialInvite}
-            onConnect={onboarding.enroll}
-          />
-          <OnboardingNearAiJoin
-            blocked={busy || walletBusy}
-            onBusyChanged={setNearAiBusy}
-            onEnrolled={() => void onboarding.markEnrolled()}
-          />
-          <OnboardingWalletConnect
-            blocked={busy || nearAiBusy}
-            onBusyChanged={setWalletBusy}
-            onEnrolled={() => void onboarding.markEnrolled()}
-          />
-          <div className="flex gap-2.5 border-t border-border pt-5">
-            <Button
-              type="button"
-              variant="outline"
-              onClick={onboarding.back}
-              disabled={busy || nativeBusy}
-            >
-              Back
-            </Button>
-          </div>
-        </>
+        <OnboardingConnectionOptions
+          onboarding={onboarding}
+          initialInvite={initialInvite}
+          busy={busy}
+        />
       )}
     </section>
   );

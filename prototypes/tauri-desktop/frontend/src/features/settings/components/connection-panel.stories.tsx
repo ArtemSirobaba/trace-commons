@@ -31,6 +31,7 @@ export const Connected: Story = {
       codex_source_mode: "watch",
       gemini_source_mode: "off",
       cline_source_mode: "not_declared",
+      opencode_source_mode: "watch",
       near_ai_configured: true,
     },
   },

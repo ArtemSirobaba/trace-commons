@@ -13,10 +13,9 @@ export type RouteId = keyof typeof routePaths;
 
 const routeIds = Object.keys(routePaths) as RouteId[];
 
-export function routeIdFromPath(pathname: string): RouteId {
-  return (
-    routeIds.find((routeId) => routePaths[routeId] === pathname) ?? "insights"
-  );
+export function routeIdFromPath(pathname: string): RouteId | null {
+  if (pathname === "/") return "insights";
+  return routeIds.find((routeId) => routePaths[routeId] === pathname) ?? null;
 }
 
 export type NavItem = {

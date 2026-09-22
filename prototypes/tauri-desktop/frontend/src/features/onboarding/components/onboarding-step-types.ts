@@ -1,6 +1,8 @@
-import type { useProjects } from "../../settings/hooks/use-projects";
-import type { useSettings } from "../../settings/hooks/use-settings";
-import type { useSourceRoots } from "../../settings/hooks/use-source-roots";
+import type {
+  useProjects,
+  useSettings,
+  useSourceRoots,
+} from "../../settings/public";
 import type { OnboardingStep, useOnboarding } from "../hooks/use-onboarding";
 
 export type OnboardingController = ReturnType<typeof useOnboarding>;

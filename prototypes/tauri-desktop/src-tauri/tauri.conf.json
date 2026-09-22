@@ -7,8 +7,14 @@
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../frontend/dist"
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["tracecommons"]
+      }
+    }
+  },
   "app": {
-    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Trace Commons — Tauri prototype",

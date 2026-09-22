@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Field,
@@ -8,21 +7,15 @@ import {
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { NativeSelect } from "@/components/ui/native-select";
-import { useOnboardingNearAi } from "../hooks/use-onboarding-near-ai";
+import type { useOnboardingNearAi } from "../hooks/use-onboarding-near-ai";
 
 export function OnboardingNearAiJoin({
-  onEnrolled,
-  onBusyChanged,
+  nearAi,
   blocked = false,
 }: {
-  onEnrolled: () => void;
-  onBusyChanged?: (busy: boolean) => void;
+  nearAi: ReturnType<typeof useOnboardingNearAi>;
   blocked?: boolean;
 }) {
-  const nearAi = useOnboardingNearAi(onEnrolled);
-  useEffect(() => {
-    onBusyChanged?.(nearAi.busy);
-  }, [nearAi.busy, onBusyChanged]);
   return (
     <section className="grid gap-4 border-t border-border pt-5">
       <div>

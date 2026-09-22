@@ -2,8 +2,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useState } from "react";
 import { coreKeys } from "../../../lib/tauri/query-keys";
 import { useCoreStatus } from "../../../lib/tauri/use-core-status";
-import { settingsKeys } from "../../settings/api/query-keys";
-import { waitingKeys } from "../../waiting/api/query-keys";
+import { settingsKeys } from "../../settings/public";
+import { waitingKeys } from "../../waiting/public";
 import {
   type BalanceStatus,
   type CredentialStatus,

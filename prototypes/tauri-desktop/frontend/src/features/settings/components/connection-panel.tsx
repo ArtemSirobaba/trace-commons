@@ -10,6 +10,7 @@ const sources = [
   ["Codex", "codex_source_mode"],
   ["Gemini CLI", "gemini_source_mode"],
   ["Cline", "cline_source_mode"],
+  ["OpenCode", "opencode_source_mode"],
 ] as const;
 
 function modeLabel(value: unknown) {

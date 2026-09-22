@@ -1,8 +1,6 @@
 import { useState } from "react";
 import { PageHeader } from "../../components/page-header";
-import { useProjects } from "../settings/hooks/use-projects";
-import { useSettings } from "../settings/hooks/use-settings";
-import { useSourceRoots } from "../settings/hooks/use-source-roots";
+import { useProjects, useSettings, useSourceRoots } from "../settings/public";
 import { OnboardingStepContent } from "./components/onboarding-step-content";
 import { ScrubDisclosure } from "./components/scrub-disclosure";
 import { useOnboarding } from "./hooks/use-onboarding";
