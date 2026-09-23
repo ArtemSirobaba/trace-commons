@@ -49,20 +49,20 @@ export function ArmingOffer({
           )}
           <div className="mt-6 flex gap-2.5">
             <Button
-              className="rounded-lg border-0 bg-primary px-3.5 py-2.5 text-[12px] font-bold text-primary-foreground hover:bg-primary/80"
-              type="button"
-              onClick={() => setConfirming(true)}
-              disabled={busy || !copy.data}
-            >
-              {copy.data?.confirm ?? "Loading…"}
-            </Button>
-            <Button
               className="rounded-[7px] border border-border bg-background px-[11px] py-2 text-[11px] font-bold text-foreground hover:border-primary hover:text-primary"
               type="button"
               onClick={onDecline}
               disabled={busy || !copy.data}
             >
               {copy.data?.decline ?? "Loading…"}
+            </Button>
+            <Button
+              className="rounded-[7px] border border-border bg-background px-[11px] py-2 text-[11px] font-bold text-foreground hover:border-primary hover:text-primary"
+              type="button"
+              onClick={() => setConfirming(true)}
+              disabled={busy || !copy.data}
+            >
+              {copy.data?.confirm ?? "Loading…"}
             </Button>
           </div>
         </>
@@ -90,6 +90,7 @@ export function ArmingOffer({
               </Button>
               <Button
                 type="button"
+                variant="outline"
                 onClick={() => {
                   setConfirming(false);
                   onAccept();

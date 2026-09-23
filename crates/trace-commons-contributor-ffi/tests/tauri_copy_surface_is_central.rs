@@ -209,6 +209,7 @@ fn copy_commands_reach_the_frontend_through_tauri_and_render_at_safety_surfaces(
     }
     assert!(admission.contains("!confirmed"));
     assert!(admission.contains("mutation.mutate(true)"));
+    assert!(!admission.contains("Admission preparation could not be completed. Nothing was sent."));
 
     let withdrawal = read(
         &root,
@@ -234,6 +235,16 @@ fn copy_commands_reach_the_frontend_through_tauri_and_render_at_safety_surfaces(
     assert!(near_ai.contains("disclosure?.what"));
     assert!(near_ai.contains("disclosure?.action"));
     assert!(near_ai.contains("!disclosure"));
+    let credential_cost = near_ai
+        .find("{disclosures.data.credential_cost}")
+        .expect("NEAR AI credential cost is rendered");
+    let sign_in = near_ai
+        .find("Start sign-in")
+        .expect("NEAR AI sign-in action is rendered");
+    assert!(
+        credential_cost < sign_in,
+        "NEAR AI credential cost must appear before the sign-in action"
+    );
 
     let private_inference = read(
         &root,
@@ -243,6 +254,41 @@ fn copy_commands_reach_the_frontend_through_tauri_and_render_at_safety_surfaces(
     assert!(private_inference.contains("copy.offer_exposure"));
     assert!(private_inference.contains("copy.offer_no_repoint"));
     assert!(private_inference.contains("disabled={busy || !copy}"));
+    for stale_label in [
+        "OPTIONAL PRIVATE INFERENCE",
+        "\"Private inference\"",
+        "Enable private inference",
+    ] {
+        assert!(
+            !private_inference.contains(stale_label),
+            "private inference's internal name must not be contributor-facing: {stale_label}"
+        );
+    }
+
+    let arming = read(
+        &root,
+        "tauri-desktop/frontend/src/features/waiting/components/arming-offer.tsx",
+    );
+    let decline = arming
+        .find("copy.data?.decline")
+        .expect("arming decline copy is rendered");
+    let confirm = arming
+        .find("copy.data?.confirm")
+        .expect("arming confirmation copy is rendered");
+    assert!(
+        decline < confirm,
+        "the arming offer must put the non-consequential action first"
+    );
+    assert!(
+        !arming.contains("bg-primary"),
+        "the arming confirmation must not be visually accented"
+    );
+
+    let history_row = read(
+        &root,
+        "tauri-desktop/frontend/src/features/history/components/history-row.tsx",
+    );
+    assert!(history_row.contains("still being scored"));
 
     let eligibility = read(
         &root,

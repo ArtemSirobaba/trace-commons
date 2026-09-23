@@ -184,7 +184,7 @@ pub(crate) fn open_system_settings(area: String) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = area;
-        return Err("system-settings-unavailable".to_owned());
+        Err("system-settings-unavailable".to_owned())
     }
     #[cfg(target_os = "macos")]
     open_url(url)
@@ -206,7 +206,7 @@ fn open_url(url: &str) -> Result<(), String> {
         .map(|_| ())
         .map_err(|_| "external-url-open-failed".to_owned());
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let status = Command::new("xdg-open").arg(&url).status();
+    let status = Command::new("xdg-open").arg(url).status();
 
     #[cfg(not(target_os = "windows"))]
     status

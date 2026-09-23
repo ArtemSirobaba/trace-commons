@@ -65,6 +65,24 @@ export function OnboardingNearAiJoin({
           <p className="m-0 text-[12px] text-muted-foreground">
             {disclosure?.needs_login ?? "Sign in disclosure unavailable."}
           </p>
+          {disclosures.data ? (
+            <div className="grid gap-2 rounded-md border border-border p-3 text-[11px] leading-[1.55] text-muted-foreground">
+              <p className="m-0 whitespace-pre-line">
+                {disclosures.data.credential_cost}
+              </p>
+              {nearAi.provider === "near" && (
+                <p className="m-0">
+                  {disclosures.data.credential_wallet_notice}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="m-0 text-[11px] text-destructive">
+              {disclosures.isError
+                ? "Credential disclosure unavailable. Sign-in is disabled."
+                : "Loading credential disclosure…"}
+            </p>
+          )}
           <div className="flex flex-wrap items-end gap-2.5">
             <Field>
               <FieldLabel htmlFor="near-ai-provider">Provider</FieldLabel>
@@ -95,24 +113,6 @@ export function OnboardingNearAiJoin({
               {nearAi.start.isPending ? "Starting…" : "Start sign-in"}
             </Button>
           </div>
-          {disclosures.data ? (
-            <div className="grid gap-2 rounded-md border border-border p-3 text-[11px] leading-[1.55] text-muted-foreground">
-              <p className="m-0 whitespace-pre-line">
-                {disclosures.data.credential_cost}
-              </p>
-              {nearAi.provider === "near" && (
-                <p className="m-0">
-                  {disclosures.data.credential_wallet_notice}
-                </p>
-              )}
-            </div>
-          ) : (
-            <p className="m-0 text-[11px] text-destructive">
-              {disclosures.isError
-                ? "Credential disclosure unavailable. Sign-in is disabled."
-                : "Loading credential disclosure…"}
-            </p>
-          )}
           {nearAi.browserUrl && (
             <p className="m-0 text-[12px] text-muted-foreground">
               Open sign-in:{" "}

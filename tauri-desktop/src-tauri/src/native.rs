@@ -225,6 +225,7 @@ fn notification_state(status: i32) -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn notification_can_post(status: i32) -> bool {
     matches!(status, 2 | 3)
 }
@@ -240,6 +241,7 @@ fn login_item_state(status: i32) -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn login_item_change_succeeded(status: i32, enabled: bool) -> bool {
     if enabled {
         matches!(status, 1 | 2)

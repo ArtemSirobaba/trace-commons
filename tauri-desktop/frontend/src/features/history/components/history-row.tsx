@@ -76,7 +76,7 @@ export function HistoryRow({
         ))}
         <small>
           Final credit: {formatCredit(record.credit_points_final)} · Pending
-          credit: {formatCredit(record.credit_points_pending)}
+          credit: {formatPendingCredit(record.credit_points_pending)}
         </small>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -119,4 +119,8 @@ export function HistoryRow({
 
 function formatCredit(value: number | null) {
   return value === null ? "not issued" : value.toFixed(1);
+}
+
+function formatPendingCredit(value: number | null) {
+  return value === null || value === 0 ? "still being scored" : value.toFixed(1);
 }

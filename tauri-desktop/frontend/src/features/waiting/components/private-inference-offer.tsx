@@ -17,11 +17,11 @@ export function PrivateInferenceOffer({
   return (
     <section className="mb-4 rounded-2xl border border-border bg-card/80 p-[22px_26px]">
       <span className="mb-3 block font-mono text-[10px] font-extrabold leading-none tracking-[.16em] text-primary">
-        OPTIONAL PRIVATE INFERENCE
+        OPTIONAL PRIVATE AI
       </span>
       {offered && (
         <>
-          <h2>{copy?.offer_title ?? "Private inference"}</h2>
+          <h2>{copy?.offer_title ?? "Private AI"}</h2>
           {copy ? (
             <div className="grid gap-2">
               <p className="m-0">{copy.offer_what}</p>
@@ -32,8 +32,8 @@ export function PrivateInferenceOffer({
           ) : (
             <p className="text-destructive">
               {disclosure.isError
-                ? "Private inference disclosure unavailable. Enabling is disabled."
-                : "Loading private inference disclosure…"}
+                ? "Private AI disclosure unavailable. Enabling is disabled."
+                : "Loading Private AI disclosure…"}
             </p>
           )}
           <div className="mt-6 flex gap-2.5">
@@ -43,7 +43,7 @@ export function PrivateInferenceOffer({
               onClick={() => onAnswer(true)}
               disabled={busy || !copy}
             >
-              {copy?.offer_accept ?? "Enable private inference"}
+              {copy?.offer_accept ?? "Turn it on"}
             </Button>
             <Button
               className="rounded-[7px] border border-border bg-background px-[11px] py-2 text-[11px] font-bold text-foreground hover:border-primary hover:text-primary"

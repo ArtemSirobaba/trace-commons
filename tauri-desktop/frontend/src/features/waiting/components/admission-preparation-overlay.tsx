@@ -36,7 +36,7 @@ export function AdmissionPreparationOverlay({
   const disclosure = copy.data?.admission;
   const error = mutation.isError
     ? (disclosure?.failed ??
-      "Admission preparation could not be completed. Nothing was sent.")
+      "Admission preparation could not be completed.")
     : mutation.isSuccess && !mutation.data.ready
       ? mutation.data.message
       : null;
