@@ -562,6 +562,8 @@ impl AttachedDaemon {
 mod tests {
     use super::*;
     use crate::daemon::start_embedded;
+    #[cfg(windows)]
+    use std::sync::Arc;
     use std::sync::mpsc;
 
     /// The whole point: a second starter is refused the lock, and attaches
