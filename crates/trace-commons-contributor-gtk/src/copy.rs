@@ -160,14 +160,12 @@ pub const SUBMIT_ALL_TOOLTIP: &str = "Approves every waiting session from this p
 /// its primary-action styling -- the two buttons take a contributor's queue
 /// in opposite directions.
 pub use trace_commons_contributor::project_copy::IGNORE_PROJECT;
-///
+
 /// Word for word what macOS and Windows put on the same button. Three
 /// shells drift, and a tooltip nobody tests drifts first: this one is
 /// `ProjectIgnoreCopy.tooltip` there.
 pub use trace_commons_contributor::project_copy::IGNORE_PROJECT_TOOLTIP;
-pub use trace_commons_contributor::project_copy::{
-    ignore_project_body, ignore_project_reconciled, ignore_project_title,
-};
+pub use trace_commons_contributor::project_copy::ignore_project_title;
 
 /// The removal clause is dropped when nothing is waiting.
 ///
@@ -177,6 +175,7 @@ pub use trace_commons_contributor::project_copy::{
 /// handed a number and must be right about whatever number it is handed --
 /// "removes 0 waiting traces" would be both wrong and alarming -- not
 /// because a caller is known to produce zero.
+pub use trace_commons_contributor::project_copy::ignore_project_body;
 
 /// What is said afterwards when the daemon removed a different number than
 /// the confirmation named.
@@ -190,6 +189,7 @@ pub use trace_commons_contributor::project_copy::{
 /// `None` when the two agree, which is the ordinary case -- a line that
 /// appears every time to say nothing happened is noise, and noise is how a
 /// line that matters gets skipped.
+pub use trace_commons_contributor::project_copy::ignore_project_reconciled;
 
 /// The four things a search can find, in the words the sheet says them.
 ///
