@@ -1,10 +1,5 @@
 import type { CoreStatus, CoreStatusState } from "../../lib/tauri/types";
 
-export type ProfileDraft = {
-  handle: string;
-  bio: string;
-};
-
 export type ProfilePageProps = {
   coreStatus: CoreStatus | null;
   coreStatusState: CoreStatusState;
