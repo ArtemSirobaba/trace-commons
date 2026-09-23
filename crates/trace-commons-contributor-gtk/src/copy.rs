@@ -165,7 +165,9 @@ pub use trace_commons_contributor::project_copy::IGNORE_PROJECT;
 /// shells drift, and a tooltip nobody tests drifts first: this one is
 /// `ProjectIgnoreCopy.tooltip` there.
 pub use trace_commons_contributor::project_copy::IGNORE_PROJECT_TOOLTIP;
-pub use trace_commons_contributor::project_copy::{ignore_project_body, ignore_project_reconciled, ignore_project_title};
+pub use trace_commons_contributor::project_copy::{
+    ignore_project_body, ignore_project_reconciled, ignore_project_title,
+};
 
 /// The removal clause is dropped when nothing is waiting.
 ///
@@ -1071,8 +1073,8 @@ pub const NOT_NOW: &str = "Not now";
 /// The evidence, stated before the question, so a contributor who reads only
 /// the first line still learns why they are being asked.
 pub use trace_commons_contributor::project_copy::{
-    arming_offer_evidence, arming_offer_question, ARMING_OFFER_CONFIRM, ARMING_OFFER_DECLINE,
-    ARMING_BODY,
+    ARMING_BODY, ARMING_OFFER_CONFIRM, ARMING_OFFER_DECLINE, arming_offer_evidence,
+    arming_offer_question,
 };
 
 // --- Arming ------------------------------------------------------------
