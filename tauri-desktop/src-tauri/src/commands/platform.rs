@@ -607,14 +607,19 @@ mod tests {
 
     #[test]
     fn selected_directories_are_absolute_and_git_repositories_are_checked() {
-        assert!(existing_directory("/", "directory-required").is_ok());
+        let temporary_directory = std::env::temp_dir();
+        let temporary_directory = temporary_directory.to_str().unwrap();
+        assert!(existing_directory(temporary_directory, "directory-required").is_ok());
         assert_eq!(
             existing_directory("relative", "directory-required").unwrap_err(),
             "directory-required"
         );
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         assert!(git_repository(workspace.to_str().unwrap()).is_ok());
-        assert_eq!(git_repository("/").unwrap_err(), "git-repository-required");
+        assert_eq!(
+            git_repository(temporary_directory).unwrap_err(),
+            "git-repository-required"
+        );
     }
 
     #[test]

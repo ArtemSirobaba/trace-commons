@@ -104,9 +104,13 @@ mod tests {
     fn routing_token_directory_is_optional_but_never_relative() {
         assert_eq!(routing_token_dir(None).unwrap(), None);
         assert_eq!(routing_token_dir(Some("  ".to_owned())).unwrap(), None);
+        let absolute = std::env::temp_dir()
+            .join("ironwire")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
-            routing_token_dir(Some("/tmp/ironwire".to_owned())).unwrap(),
-            Some("/tmp/ironwire".to_owned())
+            routing_token_dir(Some(absolute.clone())).unwrap(),
+            Some(absolute)
         );
         assert_eq!(
             routing_token_dir(Some(".ironwire".to_owned())).unwrap_err(),
