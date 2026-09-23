@@ -39,7 +39,6 @@ function parseCoreStatus(value: unknown): CoreStatus {
 export async function getCoreStatus(): Promise<CoreStatus> {
   if (!isTauri()) {
     return {
-      prototype: true,
       state_dir: "browser-preview",
       startup: "needs_roots",
       daemon: {
@@ -61,7 +60,6 @@ export function isTauriRuntime(): boolean {
 }
 
 type DaemonReadMethod =
-  | "certificate_detail"
   | "get_public_profile"
   | "get_settings"
   | "history_rollup"

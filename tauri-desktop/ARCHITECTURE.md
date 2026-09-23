@@ -33,8 +33,8 @@ and GTK shells remain unchanged; no legacy app is removed by this work.
 
 - macOS and Tauri both register `tracecommons://`; choose callback ownership
   before distributing both.
-- Tauri-only `certificate_detail` is outside legacy parity; decide separately
-  whether it remains an additive feature.
+- Certificate display stays within native parity: held-session list and shared
+  copy only; no Tauri-only certificate detail surface.
 - Existing-daemon attachment supports Unix sockets on macOS/Linux. Windows
   named-pipe attachment remains unsupported.
 - Tauri tray still lacks legacy health, budget, and armed-project summaries;

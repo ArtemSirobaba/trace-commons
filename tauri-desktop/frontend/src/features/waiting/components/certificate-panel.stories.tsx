@@ -10,6 +10,13 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 export const Held: Story = {
   args: {
+    copy: {
+      list_title: "Sessions carrying a witness certificate",
+      row_line:
+        "A witness certificate is held for this session, so what you send carries signed proof of the reviewed bytes.",
+      list_empty:
+        "Nothing here yet. A session joins this list once your witness has reviewed it.",
+    },
     entries: [
       {
         entry_id: "entry-1",
@@ -37,6 +44,13 @@ export const Held: Story = {
 
 export const Empty: Story = {
   args: {
+    copy: {
+      list_title: "Sessions carrying a witness certificate",
+      row_line:
+        "A witness certificate is held for this session, so what you send carries signed proof of the reviewed bytes.",
+      list_empty:
+        "Nothing here yet. A session joins this list once your witness has reviewed it.",
+    },
     entries: [
       {
         entry_id: "entry-2",

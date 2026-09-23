@@ -4,6 +4,7 @@ const TAURI_COMMANDS: &[&str] = &[
     "core_status",
     "queue_outcome_line",
     "attestation_copy",
+    "certificate_copy",
     "daemon_call",
     "preview_entry",
     "dismiss_entry",

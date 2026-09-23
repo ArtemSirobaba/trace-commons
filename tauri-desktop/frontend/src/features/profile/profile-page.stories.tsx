@@ -13,7 +13,6 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 
 const localCoreStatus = {
-  prototype: true,
   state_dir: "storybook-preview",
   startup: "needs_roots" as const,
   daemon: {

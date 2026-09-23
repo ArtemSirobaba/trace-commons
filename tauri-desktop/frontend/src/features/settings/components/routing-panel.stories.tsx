@@ -19,7 +19,6 @@ export const Connected: Story = {
   args: {
     snapshot,
     status: {
-      prototype: true,
       state_dir: "preview",
       startup: "running",
       daemon: {

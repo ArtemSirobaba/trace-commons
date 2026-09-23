@@ -236,7 +236,6 @@ impl AppState {
         };
 
         Ok(serde_json::json!({
-            "prototype": true,
             "state_dir": state_dir,
             "startup": startup,
             "daemon": daemon,

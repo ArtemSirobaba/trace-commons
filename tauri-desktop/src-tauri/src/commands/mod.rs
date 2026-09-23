@@ -19,6 +19,7 @@ pub(crate) fn handler<R: tauri::Runtime>()
         daemon::core_status,
         daemon::queue_outcome_line,
         daemon::attestation_copy,
+        daemon::certificate_copy,
         daemon::daemon_call,
         daemon::preview_entry,
         daemon::dismiss_entry,

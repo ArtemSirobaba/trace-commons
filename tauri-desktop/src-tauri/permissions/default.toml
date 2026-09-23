@@ -4,6 +4,7 @@ permissions = [
   "allow-core-status",
   "allow-queue-outcome-line",
   "allow-attestation-copy",
+  "allow-certificate-copy",
   "allow-daemon-call",
   "allow-preview-entry",
   "allow-dismiss-entry",

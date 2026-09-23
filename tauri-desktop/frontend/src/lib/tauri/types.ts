@@ -1,7 +1,6 @@
 import { z } from "zod";
 
 export const coreStatusSchema = z.object({
-  prototype: z.boolean(),
   state_dir: z.string(),
   startup: z.enum(["running", "needs_roots"]),
   daemon: z.object({

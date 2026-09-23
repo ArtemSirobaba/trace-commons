@@ -44,6 +44,16 @@ pub(crate) fn attestation_copy(label: String, reason: Option<String>) -> serde_j
 }
 
 #[tauri::command]
+pub(crate) fn certificate_copy(evidence_admitted: bool) -> serde_json::Value {
+    let copy = trace_commons_contributor::private_inference_copy::private_inference_copy();
+    serde_json::json!({
+        "list_title": trace_commons_contributor::private_inference_copy::certificate_list_title(evidence_admitted),
+        "row_line": trace_commons_contributor::private_inference_copy::certificate_row_line(evidence_admitted),
+        "list_empty": copy.certificate_list_empty,
+    })
+}
+
+#[tauri::command]
 pub(crate) async fn daemon_call(
     state: State<'_, AppState>,
     method: String,

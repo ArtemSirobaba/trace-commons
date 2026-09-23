@@ -11,7 +11,6 @@ use trace_commons_contributor::{
 use crate::state::{AppState, DaemonConnection, state_directory};
 
 pub(crate) const READ_ONLY_METHODS: &[&str] = &[
-    "certificate_detail",
     "get_public_profile",
     "get_settings",
     "harness_list",

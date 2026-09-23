@@ -4,6 +4,7 @@ import { CenteredNotice } from "../../components/centered-notice";
 import { PageHeader } from "../../components/page-header";
 import { StatCard } from "../../components/stat-card";
 import type { CoreStatus } from "../../lib/tauri/types";
+import { useSettings } from "../settings/public";
 import { ArmingOffer } from "./components/arming-offer";
 import { CertificatePanel } from "./components/certificate-panel";
 import { PreviewInspector } from "./components/preview-inspector";
@@ -15,6 +16,7 @@ import { WaitingProjectFolder } from "./components/waiting-project-folder";
 import { WaitingProjectGroup } from "./components/waiting-project-group";
 import { WaitingReview } from "./components/waiting-review";
 import { useArmingOffer } from "./hooks/use-arming-offer";
+import { useCertificateCopy } from "./hooks/use-certificate-copy";
 import { usePrivateInferenceOffer } from "./hooks/use-private-inference-offer";
 import { useQueueOutcomeCounts } from "./hooks/use-queue-outcome-counts";
 import { useWaitingBulkApproval } from "./hooks/use-waiting-bulk-approval";
@@ -30,6 +32,9 @@ export function WaitingPage({ status }: { status: CoreStatus | null }) {
   const arming = useArmingOffer();
   const privateInference = usePrivateInferenceOffer();
   const outcomes = useQueueOutcomeCounts();
+  const settings = useSettings();
+  const evidenceAdmitted = settings.data?.admission_evidence_required === true;
+  const certificateCopy = useCertificateCopy(evidenceAdmitted);
   const [inspecting, setInspecting] = useState(false);
   const entries = waiting.data?.pending ?? [];
   const [openProjectId, setOpenProjectId] = useState<string | null>(null);
@@ -102,7 +107,7 @@ export function WaitingPage({ status }: { status: CoreStatus | null }) {
         onUndo={() => void undo.undo()}
         onDismiss={undo.dismiss}
       />
-      <CertificatePanel entries={entries} />
+      <CertificatePanel entries={entries} copy={certificateCopy.data ?? null} />
       <QueueOutcomeDisclosure
         reasons={outcomes.data?.reasons ?? null}
         lines={outcomes.data?.lines ?? {}}
