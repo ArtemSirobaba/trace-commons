@@ -15,10 +15,15 @@ export function WitnessReviewOverlay({
   mutation: WitnessMutation;
 }) {
   const error = mutation.isError
-    ? "Witness review could not be completed. Nothing was sent."
+    ? "Witness review result could not be confirmed. Check the entry's current state before retrying."
     : mutation.isSuccess && !mutation.data.ready
-      ? mutation.data.message
+      ? (mutation.data.message ?? "Witness review was not confirmed.")
       : null;
+  const redactionSummary = mutation.data?.ready
+    ? Object.entries(mutation.data.summary.redactions)
+        .map(([label, count]) => `${label} ${count}`)
+        .join(" · ") || "No redactions reported"
+    : null;
   return (
     <ResponsiveOverlay
       open={open}
@@ -55,9 +60,17 @@ export function WitnessReviewOverlay({
           </p>
         )}
         {mutation.isSuccess && mutation.data.ready && (
-          <p className="m-0 text-primary">
-            {mutation.data.summary ?? "Witness review is ready."}
-          </p>
+          <div className="grid gap-2 text-primary">
+            <p className="m-0">
+              Reviewed envelope:{" "}
+              {mutation.data.summary.would_send_bytes.toLocaleString()} bytes ·{" "}
+              {mutation.data.summary.event_count.toLocaleString()} events
+            </p>
+            {redactionSummary && <p className="m-0">{redactionSummary}</p>}
+            <p className="m-0">
+              Residual risk: {mutation.data.summary.residual_risk}
+            </p>
+          </div>
         )}
       </div>
     </ResponsiveOverlay>

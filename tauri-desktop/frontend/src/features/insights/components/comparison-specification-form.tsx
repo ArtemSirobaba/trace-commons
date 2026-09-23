@@ -69,10 +69,16 @@ export function ComparisonSpecificationForm({
       (task) => task.task.context && task.source_qualification,
     );
     if (!candidate?.task.context) return;
-    const cohorts = tasks
-      .flatMap((task) => task.source_qualification?.declared_model_cohort ?? [])
-      .filter((value, index, all) => all.indexOf(value) === index)
-      .join(", ");
+    const cohortLabels = Array.from(
+      new Set(
+        tasks.flatMap(
+          (task) => task.source_qualification?.declared_model_cohort ?? [],
+        ),
+      ),
+    ).sort();
+    // The schema requires exactly two sorted, unique labels. Leave incomplete
+    // or multi-cohort data for the user to choose instead of seeding an invalid draft.
+    const cohorts = cohortLabels.length === 2 ? cohortLabels.join(", ") : "";
     reset({
       projectId: candidate.task.context.project_id,
       language: candidate.task.context.language.value ?? "",

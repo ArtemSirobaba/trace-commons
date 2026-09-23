@@ -34,18 +34,58 @@ function witnessView(value: unknown) {
   };
 }
 
+function count(value: RecordValue, key: string): number {
+  const item = value[key];
+  if (typeof item !== "number" || !Number.isSafeInteger(item) || item < 0)
+    throw new Error(`Invalid witness summary field: ${key}`);
+  return item;
+}
+
+function witnessSummary(value: unknown): WitnessReviewSummary {
+  const item = record(value, "witness summary");
+  const redactions = record(item.redactions, "witness redactions");
+  if (
+    Object.values(redactions).some(
+      (value) =>
+        typeof value !== "number" || !Number.isSafeInteger(value) || value < 0,
+    )
+  ) {
+    throw new Error("Invalid witness summary redactions");
+  }
+  return {
+    would_send_bytes: count(item, "would_send_bytes"),
+    event_count: count(item, "event_count"),
+    redactions: redactions as Record<string, number>,
+    residual_risk: string(item, "residual_risk"),
+  };
+}
+
 export type AdmissionPreparation = {
   ready: boolean;
   state: string;
   message: string;
 };
 
-export type WitnessReview = {
-  ready: boolean;
-  state: string;
-  message: string | null;
-  summary: string | null;
+export type WitnessReviewSummary = {
+  would_send_bytes: number;
+  event_count: number;
+  redactions: Record<string, number>;
+  residual_risk: string;
 };
+
+export type WitnessReview =
+  | {
+      ready: true;
+      state: string;
+      message: null;
+      summary: WitnessReviewSummary;
+    }
+  | {
+      ready: false;
+      state: string;
+      message: string | null;
+      summary: null;
+    };
 
 export async function getWitnessReviewSupport(): Promise<boolean> {
   const value = await invokeTauri("witness_preview_support");
@@ -82,11 +122,18 @@ export async function requestWitnessReview(
   );
   const rendered =
     response.view === undefined ? null : witnessView(response.view);
+  if (response.status === "ready") {
+    return {
+      ready: true,
+      state: rendered?.state ?? "Ready",
+      message: null,
+      summary: witnessSummary(response.summary),
+    };
+  }
   return {
-    ready: response.status === "ready",
-    state:
-      rendered?.state ?? (response.status === "ready" ? "Ready" : "Unknown"),
+    ready: false,
+    state: rendered?.state ?? "Unknown",
     message: rendered?.message ?? null,
-    summary: response.status === "ready" ? "Witness review is ready." : null,
+    summary: null,
   };
 }

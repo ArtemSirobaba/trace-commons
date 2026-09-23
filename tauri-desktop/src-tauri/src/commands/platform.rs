@@ -461,13 +461,19 @@ fn picker_result(output: std::process::Output) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub(crate) fn pick_directory(purpose: String) -> Result<String, String> {
+pub(crate) async fn pick_directory(purpose: String) -> Result<String, String> {
     let prompt = match purpose.as_str() {
         "repository" => "Choose a Git repository",
         "source_root" => "Choose a session folder",
         _ => return Err("directory-picker-purpose-invalid".to_owned()),
     };
 
+    tauri::async_runtime::spawn_blocking(move || pick_directory_blocking(prompt))
+        .await
+        .map_err(|_| "directory-picker-unavailable".to_owned())?
+}
+
+fn pick_directory_blocking(prompt: &'static str) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     let output = Command::new("osascript")
         .args([

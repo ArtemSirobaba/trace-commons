@@ -54,9 +54,10 @@ export async function withdrawHistory(
   submissionId: string,
 ): Promise<WithdrawalResult> {
   const value = record(await invokeTauri("withdraw_history", { submissionId }));
+  const withdrawn = value.withdrawn;
   const reach = value.distribution_reach;
   if (
-    (value.withdrawn !== undefined && typeof value.withdrawn !== "boolean") ||
+    typeof withdrawn !== "boolean" ||
     (reach !== undefined && reach !== null && typeof reach !== "string") ||
     (value.token_deletion_note !== undefined &&
       value.token_deletion_note !== null &&
@@ -70,7 +71,7 @@ export async function withdrawHistory(
       ? reach
       : null;
   return {
-    withdrawn: value.withdrawn !== false,
+    withdrawn,
     distribution_reach: knownReach,
     token_deletion_note:
       value.token_deletion_note === undefined
