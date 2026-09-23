@@ -4,7 +4,7 @@ import { CenteredNotice } from "../../components/centered-notice";
 import { PageHeader } from "../../components/page-header";
 import { StatCard } from "../../components/stat-card";
 import type { CoreStatus } from "../../lib/tauri/types";
-import { useSettings } from "../settings/public";
+import { useProjects, useSettings } from "../settings/public";
 import { ArmingOffer } from "./components/arming-offer";
 import { CertificatePanel } from "./components/certificate-panel";
 import { PreviewInspector } from "./components/preview-inspector";
@@ -33,6 +33,7 @@ export function WaitingPage({ status }: { status: CoreStatus | null }) {
   const privateInference = usePrivateInferenceOffer();
   const outcomes = useQueueOutcomeCounts();
   const settings = useSettings();
+  const projects = useProjects();
   const evidenceAdmitted = settings.data?.admission_evidence_required === true;
   const certificateCopy = useCertificateCopy(evidenceAdmitted);
   const [inspecting, setInspecting] = useState(false);
@@ -173,7 +174,10 @@ export function WaitingPage({ status }: { status: CoreStatus | null }) {
                 message={bulk.messages[openGroup[0]]}
                 showSubmitAll={false}
                 onReview={(entryId) => void review.review(entryId)}
-                onSubmitAll={(id) => void bulk.approve(id)}
+                onSubmitAll={(id) => void bulk.approve(id, openGroup[1].label)}
+                onSubmitAllAs={(id, outcome) =>
+                  void bulk.approve(id, openGroup[1].label, outcome)
+                }
               />
             </div>
           ) : (
@@ -185,13 +189,21 @@ export function WaitingPage({ status }: { status: CoreStatus | null }) {
                   label={group.label}
                   path={group.entries[0]?.project_path}
                   count={group.entries.length}
-                  busy={bulk.busyId === projectId}
+                  entries={group.entries}
+                  busy={bulk.busyId === projectId || projects.state === "busy"}
                   message={bulk.messages[projectId]}
                   onOpen={(id) => {
                     review.clear();
                     setOpenProjectId(id);
                   }}
-                  onSubmitAll={(id) => void bulk.approve(id)}
+                  onSubmitAll={(id) => void bulk.approve(id, group.label)}
+                  onSubmitAllAs={(id, outcome) =>
+                    void bulk.approve(id, group.label, outcome)
+                  }
+                  onIgnore={async (id) => {
+                    await projects.setMode(id, "ignore");
+                    await waiting.refresh();
+                  }}
                 />
               ))}
             </div>
@@ -199,8 +211,19 @@ export function WaitingPage({ status }: { status: CoreStatus | null }) {
         <WaitingReview
           preview={review.preview}
           state={review.state}
-          error={review.error}
+        error={review.error}
           errorKind={review.errorKind}
+          eligibilityCopy={review.eligibilityCopy}
+          eligibilityPending={review.eligibilityPending}
+          eligibilityError={review.eligibilityError}
+          outcomeCopy={review.outcomeCopy}
+          outcomeCopyPending={review.outcomeCopyPending}
+          outcomeCopyError={review.outcomeCopyError}
+          verdict={review.verdict}
+          correction={review.correction}
+          credentialRefusal={review.credentialRefusal}
+          onVerdictChange={review.setVerdict}
+          onCorrectionChange={review.setCorrection}
           onApprove={() => void review.approve()}
           onDismiss={() => void review.dismiss()}
           onInspect={() => setInspecting(true)}

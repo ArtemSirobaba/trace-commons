@@ -45,6 +45,7 @@ export const Ready: Story = {
     busy: false,
     onReview: () => undefined,
     onSubmitAll: () => undefined,
+    onSubmitAllAs: () => undefined,
   },
 };
 export const Submitting: Story = { args: { ...Ready.args, busy: true } };

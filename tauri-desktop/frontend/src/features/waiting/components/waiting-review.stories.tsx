@@ -6,9 +6,9 @@ const preview = {
   raw_session_bytes: 16384,
   event_count: 8,
   opening_prompt: "Review the local session before contribution.",
-  redactions: { "local path": 4, secret: 1 },
-  redactions_distinct: { "local path": 2, secret: 1 },
-  pii_labels_present: ["local path"],
+  redactions: { local_path: 4, "secret:api_key": 1 },
+  redactions_distinct: { local_path: 2, "secret:api_key": 1 },
+  pii_labels_present: ["local_path"],
   consent_scopes: ["trace_submission"],
   residual_risk:
     "Some semantic context may remain after deterministic scrubbing.",
@@ -40,11 +40,38 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
+const outcomeCopy = {
+  verdict_question: "Did this session do what you asked?",
+  worked: "Worked",
+  partly: "Partly",
+  failed: "Failed",
+  verdict_caption: "Optional. This is recorded as the trace outcome; the preview above does not show it.",
+  correction_question: "What did it get wrong?",
+  correction_placeholder: "Optional",
+  correction_caption: "Stored exactly as you write it. This correction is not scrubbed.",
+  correction_credential_headline: "Nothing was sent. Your correction looks like it contains a credential.",
+  correction_credential_body: "Remove credential, rotate it, and submit again.",
+  submit_all_as: "Submit all as...",
+  submit_all_as_tooltip: "Record the same outcome for every session in this group.",
+  max_correction_chars: 2000,
+};
+
 export const Ready: Story = {
   args: {
     preview,
     state: "ready",
     error: null,
+    eligibilityCopy: null,
+    eligibilityPending: false,
+    eligibilityError: false,
+    outcomeCopy,
+    outcomeCopyPending: false,
+    outcomeCopyError: false,
+    verdict: null,
+    correction: "",
+    credentialRefusal: false,
+    onVerdictChange: () => undefined,
+    onCorrectionChange: () => undefined,
     onApprove: () => undefined,
     onDismiss: () => undefined,
     onInspect: () => undefined,

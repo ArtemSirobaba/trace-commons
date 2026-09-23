@@ -49,7 +49,7 @@ export function OnboardingConsentStep({
       <h2>How may your traces be used?</h2>
       <form
         onSubmit={form.handleSubmit(
-          (values) => void onboarding.saveConsent(values.scopes, showPrivacy),
+          (values) => void onboarding.saveConsent(values.scopes, showPrivacy === true),
         )}
       >
         <div className="my-[18px] grid gap-px border-t border-border">
@@ -87,6 +87,19 @@ export function OnboardingConsentStep({
             Loading consent options…
           </p>
         )}
+        {showPrivacy === null && (
+          <div className="grid gap-2 text-sm text-destructive" role="alert">
+            <p>Privacy settings are unavailable. Refresh before continuing.</p>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => void settings.refresh()}
+              disabled={settings.isFetching}
+            >
+              {settings.isFetching ? "Refreshing…" : "Refresh privacy settings"}
+            </Button>
+          </div>
+        )}
         <div className="mt-6 flex gap-2.5">
           {!alreadyEnrolled && (
             <Button
@@ -104,7 +117,8 @@ export function OnboardingConsentStep({
             disabled={
               busy ||
               onboarding.options.length === 0 ||
-              settings.state === "loading"
+              settings.state === "loading" ||
+              showPrivacy === null
             }
           >
             Continue

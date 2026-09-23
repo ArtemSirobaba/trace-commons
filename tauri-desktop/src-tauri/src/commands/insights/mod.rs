@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use tauri::State;
+use tauri::{
+    State,
+    ipc::{InvokeBody, Request},
+};
 
 use crate::{
     commands::platform::git_repository,
@@ -11,6 +14,24 @@ pub(crate) mod comparisons;
 
 const MAX_INSIGHTS_INPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TEST_REPORT_INPUT_BYTES: usize = 64 * 1024;
+
+fn upload_header(request: &Request<'_>, name: &str) -> Result<String, String> {
+    request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_owned)
+        .ok_or_else(|| "insights-upload-header-invalid".to_owned())
+}
+
+fn raw_upload_bytes(request: &Request<'_>, max: usize) -> Result<Vec<u8>, String> {
+    match request.body() {
+        InvokeBody::Raw(bytes) if bytes.len() <= max => Ok(bytes.clone()),
+        InvokeBody::Raw(_) => Err("insights-input-too-large".to_owned()),
+        _ => Err("insights-input-must-be-raw-bytes".to_owned()),
+    }
+}
 
 fn execute_insights(
     state_dir: PathBuf,
@@ -99,10 +120,15 @@ pub(crate) async fn insights_summary(
 #[tauri::command]
 pub(crate) async fn analyze_insight(
     state: State<'_, AppState>,
-    source: String,
-    save: bool,
-    file_bytes: Vec<u8>,
+    request: Request<'_>,
 ) -> Result<serde_json::Value, String> {
+    let source = upload_header(&request, "x-tc-source")?;
+    let save = match upload_header(&request, "x-tc-save")?.as_str() {
+        "true" => true,
+        "false" => false,
+        _ => return Err("insights-save-invalid".to_owned()),
+    };
+    let file_bytes = raw_upload_bytes(&request, MAX_INSIGHTS_INPUT_BYTES)?;
     insights_call(
         state_directory(&state)?,
         serde_json::json!({ "type": "analyze", "source": source, "save": save }),
@@ -163,9 +189,10 @@ pub(crate) async fn clear_insight_annotation(
 #[tauri::command]
 pub(crate) async fn link_test_report(
     state: State<'_, AppState>,
-    id: String,
-    file_bytes: Vec<u8>,
+    request: Request<'_>,
 ) -> Result<serde_json::Value, String> {
+    let id = upload_header(&request, "x-tc-insight-id")?;
+    let file_bytes = raw_upload_bytes(&request, MAX_TEST_REPORT_INPUT_BYTES)?;
     insights_call(
         state_directory(&state)?,
         serde_json::json!({ "type": "link_test_report", "id": id }),

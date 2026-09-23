@@ -10,6 +10,7 @@ export function ProfileEditor({
   published,
   actionState,
   actionError,
+  actionNotice,
   onSave,
   onPublish,
   onWithdraw,
@@ -18,6 +19,7 @@ export function ProfileEditor({
   published: boolean;
   actionState: "idle" | "publishing" | "withdrawing" | "error";
   actionError: string | null;
+  actionNotice: string | null;
   onSave: (values: ProfileFormValues) => void;
   onPublish: () => void;
   onWithdraw: () => void;
@@ -37,7 +39,7 @@ export function ProfileEditor({
           <h2>Shape your profile</h2>
         </div>
         <span className="whitespace-nowrap rounded-full bg-primary/10 px-2.5 py-[7px] font-mono text-[10px] font-extrabold tracking-[.08em] text-primary">
-          {saved ? "Saved in memory" : "Not published"}
+          {published ? "Published" : saved ? "Saved in memory" : "Not published"}
         </span>
       </div>
       <div className="mt-6 grid grid-cols-2 gap-4">
@@ -73,10 +75,20 @@ export function ProfileEditor({
         </label>
       </div>
       <div className="flex items-center justify-between gap-[18px] pt-[17px]">
-        <p>
-          {actionError ??
-            "Publishing sends handle and bio to community roster. It does not publish session content."}
-        </p>
+        <div aria-live="polite" className="grid gap-1">
+          {actionError ? (
+            <p role="alert" className="text-destructive">
+              {actionError}
+            </p>
+          ) : actionNotice ? (
+            <p role="status">{actionNotice}</p>
+          ) : (
+            <p>
+              Publishing sends handle and bio to community roster. It does not
+              publish session content.
+            </p>
+          )}
+        </div>
         <div className="flex flex-wrap justify-end gap-[9px]">
           <Button
             className="rounded-[7px] border border-border bg-background px-[11px] py-2 text-[11px] font-bold text-foreground hover:border-primary hover:text-primary"

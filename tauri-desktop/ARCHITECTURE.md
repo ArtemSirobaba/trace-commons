@@ -25,26 +25,48 @@ and GTK shells remain unchanged; no legacy app is removed by this work.
   state only. Derived display values stay in render.
 - Desktop listeners subscribe before consuming a cold-start deep link. A
   credential callback refreshes Private AI status, then opens Private AI.
-- Event bridge starts after daemon startup or source-root selection. Unix
-  attachments reconnect after transport loss. No-root startup keeps account-
-  free routes available. Quit confirmation and macOS Reopen are wired.
+- Event bridge starts after daemon startup or source-root selection. Existing-
+  daemon attachment supports Unix sockets on macOS/Linux and the daemon's
+  existing named pipe and ACL on Windows. It reconnects after transport loss
+  and carries status plus pushed events over one connection. Its callback
+  thread owns the persistent transport; the client refuses daemon shutdown.
+  No-root startup keeps account-free routes available. Quit confirmation and
+  macOS Reopen are wired.
 
 ## Remaining parity gates
 
-- macOS and Tauri both register `tracecommons://`; choose callback ownership
-  before distributing both.
+- The macOS app and Tauri both register `tracecommons://`. Assign callback
+  ownership before distributing both on macOS; verify cold-start and
+  already-running callback delivery from packaged builds on every OS.
 - Certificate display stays within native parity: held-session list and shared
   copy only; no Tauri-only certificate detail surface.
-- Existing-daemon attachment supports Unix sockets on macOS/Linux. Windows
-  named-pipe attachment remains unsupported.
 - Tauri tray still lacks legacy health, budget, and armed-project summaries;
   pause-until-tomorrow-morning behavior also remains unmatched.
-- Native smoke remains open for notifications, login items, tray, keychain,
-  file grants, deep links, and package behavior on each OS.
-- Signed packaging, notarization, clean-machine upgrade, provider callbacks,
-  wallet completion, and witness availability need live acceptance.
-- Bundle identifier stays `ai.tracecommons.tauri.prototype` to preserve local
-  app-data identity; decide migration before release.
+- Packaged-device acceptance remains open for notifications, login items,
+  tray, keychain, file grants, callback routing, and clean-machine install and
+  upgrade behavior on each OS. macOS also needs signed packaging and
+  notarization acceptance; provider callbacks, wallet completion, and witness
+  availability need live acceptance.
+- Contributor state now resolves through the shared core directory, including
+  `TRACE_COMMONS_CONTRIBUTOR_DIR`. Existing prototype-specific data remains
+  untouched; decide any non-destructive migration before release. Bundle
+  identity remains a release decision: the development config uses
+  `ai.tracecommons.tauri.prototype`; the release config currently uses
+  `ai.tracecommons.desktop`.
+
+## Bundles and updates
+
+- Tauri CI builds Linux AppImage and DEB packages on Ubuntu 24.04, plus Windows
+  MSI and NSIS installers on Windows. CI uploads unsigned artifacts for seven
+  days; these are build checks, not release downloads.
+- The existing signed release workflow packages the Swift, WinUI, and GTK
+  shells. Its signing identities, update feeds, and package identities do not
+  cover Tauri. Tauri has no updater plugin, update endpoint, or update signing
+  key configured; do not publish Tauri updates until those are selected and
+  tested together with the final bundle identity.
+- Tauri release promotion still needs platform signing, a separate update
+  publication flow, clean-machine install/upgrade acceptance, and a decision
+  about callback ownership where another shell claims the same URL scheme.
 
 ## Checks
 
@@ -58,6 +80,10 @@ cargo check --locked --manifest-path tauri-desktop/src-tauri/Cargo.toml
 cargo test --locked --manifest-path tauri-desktop/src-tauri/Cargo.toml
 ```
 
-`.github/workflows/tauri-desktop.yml` runs frontend and Storybook builds plus
-Rust format/check/test across macOS, Linux, and Windows. CI does not establish
-GUI, OS-permission, signed-package, or provider acceptance.
+`.github/workflows/tauri-desktop.yml` runs on every push and pull request. It
+runs frontend and Storybook builds,
+`pnpm test`, `pnpm audit`, Rust format/check/test across macOS, Linux, and
+Windows, Linux Clippy, Linux and Windows unsigned bundles, all-feature Cargo
+license/source/advisory audits, and the declared Tauri MSRV check. CI proves
+compile, test, and bundle creation; it does not establish GUI, OS-permission,
+packaged-device, signed-package, update, callback, or provider acceptance.

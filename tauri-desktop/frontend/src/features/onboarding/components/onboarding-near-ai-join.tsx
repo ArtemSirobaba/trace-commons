@@ -7,6 +7,7 @@ import {
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { NativeSelect } from "@/components/ui/native-select";
+import { useContributorDisclosureCopy } from "../../../lib/tauri/use-contributor-copy";
 import type { useOnboardingNearAi } from "../hooks/use-onboarding-near-ai";
 
 export function OnboardingNearAiJoin({
@@ -16,16 +17,17 @@ export function OnboardingNearAiJoin({
   nearAi: ReturnType<typeof useOnboardingNearAi>;
   blocked?: boolean;
 }) {
+  const disclosures = useContributorDisclosureCopy();
+  const disclosure = disclosures.data?.near_ai_enroll;
   return (
     <section className="grid gap-4 border-t border-border pt-5">
       <div>
         <span className="mb-3 block font-mono text-[10px] font-extrabold leading-none tracking-[.16em] text-primary">
           NEAR AI
         </span>
-        <h3>Join with existing NEAR AI sign-in</h3>
+        <h3>{disclosure?.title ?? "Join with NEAR AI"}</h3>
         <p className="m-0 text-[12px] leading-[1.55] text-muted-foreground">
-          This path needs no wallet. Rust verifies your existing NEAR AI session
-          with the commons before enrollment.
+          {disclosure?.what ?? "Loading NEAR AI enrollment disclosure…"}
         </p>
       </div>
       <FieldGroup>
@@ -50,14 +52,18 @@ export function OnboardingNearAiJoin({
         <Button
           type="button"
           onClick={() => nearAi.join.mutate()}
-          disabled={nearAi.busy || blocked || !nearAi.commons.trim()}
+          disabled={
+            nearAi.busy || blocked || !nearAi.commons.trim() || !disclosure
+          }
         >
-          {nearAi.join.isPending ? "Joining…" : "Join with NEAR AI"}
+          {nearAi.join.isPending
+            ? "Joining…"
+            : (disclosure?.action ?? "Join with NEAR AI")}
         </Button>
       ) : (
         <div className="grid gap-3">
           <p className="m-0 text-[12px] text-muted-foreground">
-            Sign in to NEAR AI first. Session status stays local.
+            {disclosure?.needs_login ?? "Sign in disclosure unavailable."}
           </p>
           <div className="flex flex-wrap items-end gap-2.5">
             <Field>
@@ -77,11 +83,36 @@ export function OnboardingNearAiJoin({
               type="button"
               variant="outline"
               onClick={() => nearAi.start.mutate()}
-              disabled={nearAi.busy || blocked}
+              disabled={
+                nearAi.busy ||
+                blocked ||
+                !disclosure ||
+                !disclosures.data?.credential_cost ||
+                (nearAi.provider === "near" &&
+                  !disclosures.data?.credential_wallet_notice)
+              }
             >
               {nearAi.start.isPending ? "Starting…" : "Start sign-in"}
             </Button>
           </div>
+          {disclosures.data ? (
+            <div className="grid gap-2 rounded-md border border-border p-3 text-[11px] leading-[1.55] text-muted-foreground">
+              <p className="m-0 whitespace-pre-line">
+                {disclosures.data.credential_cost}
+              </p>
+              {nearAi.provider === "near" && (
+                <p className="m-0">
+                  {disclosures.data.credential_wallet_notice}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="m-0 text-[11px] text-destructive">
+              {disclosures.isError
+                ? "Credential disclosure unavailable. Sign-in is disabled."
+                : "Loading credential disclosure…"}
+            </p>
+          )}
           {nearAi.browserUrl && (
             <p className="m-0 text-[12px] text-muted-foreground">
               Open sign-in:{" "}

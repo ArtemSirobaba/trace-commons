@@ -58,12 +58,22 @@ export function groupHistory(records: HistoryRecord[]): HistoryProjectGroup[] {
   );
 }
 
-export function quarantineExplanations(records: HistoryRecord[]): string[] {
-  return Array.from(
+export function quarantineExplanations(
+  records: HistoryRecord[],
+  heldRowFallback?: string | null,
+): string[] {
+  const explanations = Array.from(
     new Set(
       records
         .filter((record) => record.status === "quarantined")
-        .flatMap((record) => record.explanations),
+        .flatMap((record) => contributorFacingExplanations(record.explanations)),
     ),
   );
+  return explanations.length > 0 || !heldRowFallback
+    ? explanations
+    : [heldRowFallback];
+}
+
+export function contributorFacingExplanations(explanations: string[]) {
+  return explanations.filter((explanation) => !explanation.includes("sha256:"));
 }

@@ -4,6 +4,8 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useEffect, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { FormFieldError } from "../../../components/form-field-error";
+import { ConfirmActionButton } from "../../../components/confirm-action-button";
+import { useContributorDisclosureCopy } from "../../../lib/tauri/use-contributor-copy";
 import { type AnnotationFormValues, annotationFormSchema } from "../forms";
 import type { Insight } from "../types";
 import { InsightEvidencePanel } from "./insight-evidence-panel";
@@ -33,6 +35,8 @@ export function InsightDetail({
   onLinkGit,
   onUnlinkEvidence,
 }: InsightDetailProps) {
+  const contributorCopy = useContributorDisclosureCopy();
+  const deleteCopy = contributorCopy.data?.insights_ui;
   const form = useForm<AnnotationFormValues>({
     resolver: zodResolver(annotationFormSchema),
     defaultValues: {
@@ -188,14 +192,17 @@ export function InsightDetail({
       />
       <div className="mt-[18px] flex justify-end gap-[9px]">
         {saved ? (
-          <Button
-            className="rounded-[7px] border border-border bg-background px-[11px] py-2 text-[11px] font-bold text-foreground hover:border-primary hover:text-primary text-destructive"
-            type="button"
-            onClick={onDelete}
-            disabled={busy}
-          >
-            Delete saved insight
-          </Button>
+          <ConfirmActionButton
+            label={deleteCopy?.delete}
+            title={deleteCopy?.delete}
+            description={deleteCopy?.delete_confirm}
+            confirmLabel={deleteCopy?.delete}
+            cancelLabel={deleteCopy?.cancel}
+            workingLabel={deleteCopy?.working}
+            unavailableLabel="Delete confirmation copy unavailable. Reload before deleting."
+            busy={busy}
+            onConfirm={onDelete}
+          />
         ) : (
           <Button
             className="rounded-lg border-0 bg-primary px-3.5 py-2.5 text-[12px] font-bold text-primary-foreground hover:bg-primary/80"

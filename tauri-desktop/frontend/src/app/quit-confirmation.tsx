@@ -24,7 +24,7 @@ export function QuitConfirmation({
       open={open}
       onOpenChange={onOpenChange}
       title="Quit Trace Commons?"
-      description="Queued sessions remain on this device and can be reviewed after relaunch."
+      description="Quitting stops Trace Commons watching for finished sessions. Nothing is queued or sent until you open it again. Sessions already waiting remain on this device for review after relaunch."
       footer={
         <>
           <Button

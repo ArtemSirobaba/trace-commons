@@ -21,7 +21,10 @@ export function OnboardingPage({
   const roots = useSourceRoots();
   const [showScrubDisclosure, setShowScrubDisclosure] = useState(false);
   const busy = onboarding.state === "loading" || onboarding.state === "busy";
-  const showPrivacy = settings.data?.near_ai_configured === true;
+  const showPrivacy =
+    settings.state === "ready"
+      ? settings.data?.near_ai_configured === true
+      : null;
   const scrubber = useScrubberPatterns(showScrubDisclosure);
   const pageTitles = {
     welcome: "Welcome to Trace Commons",

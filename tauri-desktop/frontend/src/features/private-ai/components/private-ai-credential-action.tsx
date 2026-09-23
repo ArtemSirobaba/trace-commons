@@ -8,9 +8,11 @@ type PrivateAiController = ReturnType<typeof usePrivateAi>;
 export function PrivateAiCredentialAction({
   privateAi,
   form,
+  copyReady,
 }: {
   privateAi: PrivateAiController;
   form: UseFormReturn<PrivateAiProviderValues>;
+  copyReady: boolean;
 }) {
   const action = privateAi.credential?.view?.action;
   if (action === "cancel") {
@@ -42,7 +44,7 @@ export function PrivateAiCredentialAction({
     <Button
       className="rounded-[7px] border border-border bg-background px-[11px] py-2 text-[11px] font-bold text-foreground hover:border-primary hover:text-primary"
       type="submit"
-      disabled={privateAi.busy || !form.formState.isValid}
+      disabled={privateAi.busy || !form.formState.isValid || !copyReady}
     >
       Connect credential
     </Button>

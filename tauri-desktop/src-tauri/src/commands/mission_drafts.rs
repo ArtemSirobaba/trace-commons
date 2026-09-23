@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use tauri::State;
+use tauri::{
+    State,
+    ipc::{InvokeBody, Request},
+};
 
 use crate::state::{AppState, state_directory};
 
@@ -97,8 +100,13 @@ pub(crate) async fn mission_draft_show(
 #[tauri::command]
 pub(crate) async fn mission_draft_import(
     state: State<'_, AppState>,
-    file_bytes: Vec<u8>,
+    request: Request<'_>,
 ) -> Result<serde_json::Value, String> {
+    let file_bytes = match request.body() {
+        InvokeBody::Raw(bytes) if bytes.len() <= MAX_MISSION_INPUT_BYTES => bytes.clone(),
+        InvokeBody::Raw(_) => return Err("mission-input-too-large".to_owned()),
+        _ => return Err("mission-input-must-be-raw-bytes".to_owned()),
+    };
     mission_draft_call(
         state_directory(&state)?,
         serde_json::json!({ "type": "import" }),

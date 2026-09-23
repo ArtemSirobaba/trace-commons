@@ -1,9 +1,71 @@
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use trace_commons_contributor::{account_auth, config::ConfigStore};
 
 use crate::{
     ipc::{call_daemon, shared_state},
     state::AppState,
 };
+
+#[tauri::command]
+pub(crate) fn withdrawal_confirmation_prompt() -> &'static str {
+    trace_commons_contributor::withdraw::confirmation_prompt_unknown()
+}
+
+#[tauri::command]
+pub(crate) async fn account_session_status() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let store = ConfigStore::resolve(None)
+            .map_err(|_| "account-session-storage-unavailable".to_owned())?;
+        let signed_in = account_auth::try_load_token(&store)
+            .map_err(|_| "account-session-storage-unavailable".to_owned())?
+            .is_some();
+        Ok(serde_json::json!({
+            "signed_in": signed_in,
+            "expires_at": if signed_in { account_auth::session_status(&store) } else { None },
+        }))
+    })
+    .await
+    .map_err(|_| "account-session-status-unavailable".to_owned())?
+}
+
+#[tauri::command]
+pub(crate) async fn account_sign_in<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<serde_json::Value, String> {
+    let store =
+        ConfigStore::resolve(None).map_err(|_| "account-session-storage-unavailable".to_owned())?;
+    let config = store
+        .load_config()
+        .map_err(|_| "account-configuration-unavailable".to_owned())?
+        .ok_or_else(|| "account-enrollment-required".to_owned())?;
+    let result = account_auth::sign_in(&store, &config, true, |url| {
+        let _ = app
+            .state::<AppState>()
+            .authorize_account_sign_in_url(Some(url));
+        let _ = app.emit("account-sign-in-url", url);
+    })
+    .await;
+    app.state::<AppState>()
+        .authorize_account_sign_in_url(None)?;
+    let result = result.map_err(|_| "account-sign-in-failed".to_owned())?;
+    Ok(serde_json::json!({
+        "signed_in": true,
+        "account_id": result.account_id,
+        "expires_at": result.expires_at,
+    }))
+}
+
+#[tauri::command]
+pub(crate) async fn request_history_refresh(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    call_daemon(
+        shared_state(&state)?,
+        "refresh_history",
+        serde_json::json!({}),
+    )
+    .await
+}
 
 #[tauri::command]
 pub(crate) async fn history_detail(

@@ -90,7 +90,6 @@ pub(crate) async fn call_daemon_response(
         DaemonConnection::Embedded(shared) => {
             daemon::ipc::handle_request_async(&shared, &request).await
         }
-        #[cfg(unix)]
         DaemonConnection::Attached(attached) => tauri::async_runtime::spawn_blocking(move || {
             attached.call(&request.method, &request.params)
         })
@@ -108,7 +107,6 @@ pub(crate) fn call_daemon_blocking(
 ) -> Result<serde_json::Value, String> {
     let response = match daemon {
         DaemonConnection::Embedded(shared) => daemon::ipc::handle_local(&shared, method, params),
-        #[cfg(unix)]
         DaemonConnection::Attached(attached) => attached
             .call(method, &params)
             .map_err(|error| error.to_string())?,

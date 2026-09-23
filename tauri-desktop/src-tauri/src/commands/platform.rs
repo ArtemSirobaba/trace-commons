@@ -63,8 +63,11 @@ pub(crate) fn open_external_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn open_native_wallet_url(url: String, commons: String) -> Result<(), String> {
-    if !native_wallet_url_is_allowed(&commons, &url) {
+pub(crate) fn open_native_wallet_url(
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if !wallet_url_is_valid(&url) || !state.inner().consume_wallet_url(&url)? {
         return Err("native-wallet-url-not-allowed".to_owned());
     }
 
@@ -72,11 +75,31 @@ pub(crate) fn open_native_wallet_url(url: String, commons: String) -> Result<(),
 }
 
 #[tauri::command]
-pub(crate) fn platform_capabilities<R: Runtime>(
+pub(crate) fn open_account_sign_in_url(
+    url: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if !wallet_url_is_valid(&url) || !state.inner().consume_account_sign_in_url(&url)? {
+        return Err("account-sign-in-url-not-allowed".to_owned());
+    }
+
+    open_url(&url)
+}
+
+#[tauri::command]
+pub(crate) async fn platform_capabilities<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, AppState>,
-) -> serde_json::Value {
-    serde_json::json!({
+) -> Result<serde_json::Value, String> {
+    let (startup, notifications) = tauri::async_runtime::spawn_blocking(|| {
+        (
+            crate::native::login_item_capability(),
+            crate::native::notification_capability(),
+        )
+    })
+    .await
+    .map_err(|_| "platform-capabilities-unavailable".to_owned())?;
+    Ok(serde_json::json!({
         "schema_version": "trace_commons.platform.v1",
         "os": std::env::consts::OS,
         "package": {
@@ -85,25 +108,29 @@ pub(crate) fn platform_capabilities<R: Runtime>(
             "identifier": app.config().identifier,
             "bundled": app.config().bundle.active,
         },
-        "startup": crate::native::login_item_capability(),
-        "notifications": crate::native::notification_capability(),
+        "startup": startup,
+        "notifications": notifications,
         "updates": update_state(),
         "deep_links": {
             "state": state.inner().deep_link_state(),
             "scheme": "tracecommons",
         },
         "tray": { "state": "available" },
-    })
+    }))
 }
 
 #[tauri::command]
-pub(crate) fn notification_permission() -> serde_json::Value {
-    crate::native::notification_capability()
+pub(crate) async fn notification_permission() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(crate::native::notification_capability)
+        .await
+        .map_err(|_| "notification-permission-unavailable".to_owned())
 }
 
 #[tauri::command]
-pub(crate) fn request_notification_permission() -> Result<serde_json::Value, String> {
-    crate::native::request_notification_permission()
+pub(crate) async fn request_notification_permission() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(crate::native::request_notification_permission)
+        .await
+        .map_err(|_| "notification-permission-unavailable".to_owned())?
 }
 
 #[tauri::command]
@@ -164,23 +191,24 @@ pub(crate) fn open_system_settings(area: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn quit_app<R: Runtime>(
-    app: AppHandle<R>,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    state.inner().authorize_exit();
+pub(crate) fn quit_app<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     app.exit(0);
     Ok(())
 }
 
 fn open_url(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    let status = Command::new("open").arg(&url).status();
+    let status = Command::new("open").arg(url).status();
     #[cfg(target_os = "windows")]
-    let status = Command::new("explorer.exe").arg(&url).status();
+    return Command::new("explorer.exe")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "external-url-open-failed".to_owned());
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let status = Command::new("xdg-open").arg(&url).status();
 
+    #[cfg(not(target_os = "windows"))]
     status
         .map_err(|_| "external-url-open-failed".to_owned())?
         .success()
@@ -214,14 +242,13 @@ fn https_origin(value: &str) -> Option<String> {
     })
 }
 
-fn native_wallet_url_is_allowed(commons: &str, url: &str) -> bool {
+fn wallet_url_is_valid(url: &str) -> bool {
     url.len() <= 2048
         && url.is_ascii()
         && !url
             .chars()
             .any(|character| character.is_whitespace() || character.is_control())
-        && https_origin(commons).is_some()
-        && https_origin(url) == https_origin(commons)
+        && https_origin(url).is_some()
 }
 
 pub(crate) fn is_tracecommons_deep_link(url: &str) -> bool {
@@ -523,9 +550,9 @@ mod tests {
 
     use super::{
         credential_deep_link, deep_link_invite, existing_directory, external_url_is_allowed,
-        git_repository, installed_by_homebrew, native_wallet_url_is_allowed,
-        near_credits_url_is_allowed, public_run_deep_link, review_deep_link,
-        tracecommons_fixture_url_is_allowed, tracecommons_run_url_is_allowed,
+        git_repository, installed_by_homebrew, near_credits_url_is_allowed, public_run_deep_link,
+        review_deep_link, tracecommons_fixture_url_is_allowed, tracecommons_run_url_is_allowed,
+        wallet_url_is_valid,
     };
 
     #[test]
@@ -570,13 +597,11 @@ mod tests {
         assert!(!external_url_is_allowed(
             "https://cloud.near.ai/dashboard/organizations/example/credits\nopen"
         ));
-        assert!(native_wallet_url_is_allowed(
-            "https://commons.example/onboard",
+        assert!(wallet_url_is_valid(
             "https://commons.example/wallet/start?state=1"
         ));
-        assert!(!native_wallet_url_is_allowed(
-            "https://commons.example/onboard",
-            "https://elsewhere.example/wallet/start"
+        assert!(!wallet_url_is_valid(
+            "https://commons.example@attacker.example/wallet"
         ));
     }
 

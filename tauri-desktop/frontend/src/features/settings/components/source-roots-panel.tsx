@@ -5,6 +5,8 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { FormFieldError } from "../../../components/form-field-error";
+import { useContributorDisclosureCopy } from "../../../lib/tauri/use-contributor-copy";
+import type { ContributorDisclosureCopy } from "../../../lib/tauri/contributor-copy-api";
 import { useDirectoryPicker } from "../../../lib/tauri/use-platform-actions";
 import type { SourceMode, SourceName } from "../api/source-roots-api";
 import { type SourceRootFormValues, sourceRootFormSchema } from "../forms";
@@ -33,12 +35,14 @@ export function SourceRootsPanel({
   error,
   onSave,
 }: SourceRootsPanelProps) {
+  const disclosure = useContributorDisclosureCopy();
+  const copy = disclosure.data?.source_settings;
   return (
     <section className="rounded-2xl border border-border bg-card/80 p-[26px] block">
       <div className="flex items-start justify-between gap-[18px]">
         <div>
           <span className="mb-3 block font-mono text-[10px] font-extrabold leading-none tracking-[.16em] text-primary">
-            SOURCE ROOTS
+            {copy?.heading ?? "Source settings"}
           </span>
           <h2>Session folders</h2>
         </div>
@@ -47,9 +51,16 @@ export function SourceRootsPanel({
         </span>
       </div>
       <p className="m-0 text-[11px] leading-[1.55] text-muted-foreground">
-        Unset roots are not safe defaults. Choose a directory to watch or
-        explicitly turn each source off.
+        {copy?.explanation ?? "Loading source settings disclosure…"}
       </p>
+      {!copy && (
+        <p
+          className="-mt-[18px] mb-[18px] rounded-[9px] border border-destructive/30 bg-destructive/10 px-3.5 py-3 text-[12px] text-destructive"
+          role="alert"
+        >
+          Source settings copy unavailable. Saving is disabled until it loads.
+        </p>
+      )}
       {error && (
         <p className="-mt-[18px] mb-[18px] rounded-[9px] border border-destructive/30 bg-destructive/10 px-3.5 py-3 text-[12px] text-destructive">
           {error}
@@ -62,7 +73,20 @@ export function SourceRootsPanel({
             source={source.name}
             label={source.label}
             snapshot={snapshot}
-            busy={busy}
+            busy={busy || !copy}
+            copy={copy}
+            tool={Object.values(copy?.tools ?? {}).find(
+              (tool) => tool.key === source.name,
+            )}
+            statusLine={
+              disclosure.data?.source_check_lines[source.name]?.[
+                snapshot[`${source.name}_source_mode`] === "watch"
+                  ? "watch"
+                  : snapshot[`${source.name}_source_mode`] === "off"
+                    ? "off"
+                    : "unset"
+              ] ?? copy?.unavailable ?? ""
+            }
             onSave={onSave}
           />
         ))}
@@ -80,12 +104,20 @@ function SourceRootRow({
   label,
   snapshot,
   busy,
+  copy,
+  tool,
+  statusLine,
   onSave,
 }: {
   source: SourceName;
   label: string;
   snapshot: Record<string, unknown>;
   busy: boolean;
+  copy: ContributorDisclosureCopy["source_settings"] | undefined;
+  tool:
+    | ContributorDisclosureCopy["source_settings"]["tools"][string]
+    | undefined;
+  statusLine: string;
   onSave: (
     source: SourceName,
     mode: SourceMode,
@@ -138,10 +170,7 @@ function SourceRootRow({
     >
       <div>
         <strong>{label}</strong>
-        <span>
-          Current daemon mode:{" "}
-          {String(snapshot[`${source}_source_mode`] ?? "unset")}
-        </span>
+        <span>{statusLine || copy?.unavailable}</span>
       </div>
       <div className="flex flex-wrap items-start gap-2">
         <NativeSelect
@@ -153,8 +182,10 @@ function SourceRootRow({
             form.formState.errors.mode ? `${source}-mode-error` : undefined
           }
         >
-          <option value="watch">Watch directory</option>
-          <option value="off">Off</option>
+          <option value="watch">{copy?.watch_candidate ?? "Watch"}</option>
+          <option value="off">
+            {tool?.decline ?? copy?.no_candidate ?? "Off"}
+          </option>
         </NativeSelect>
         {modeValue === "watch" && (
           <>
@@ -162,7 +193,9 @@ function SourceRootRow({
               <span className="sr-only">{label} sessions folder</span>
               <Input
                 {...form.register("path")}
-                placeholder="/absolute/path/to/sessions"
+                placeholder={
+                  copy?.selected_folder ?? "/absolute/path/to/sessions"
+                }
                 disabled={busy || choosing}
                 aria-invalid={Boolean(pathError)}
                 aria-describedby={
@@ -177,7 +210,9 @@ function SourceRootRow({
               onClick={() => void chooseRoot()}
               disabled={busy || choosing}
             >
-              {choosing ? "Choosing…" : "Choose folder"}
+              {choosing
+                ? "Choosing…"
+                : (tool?.choose_folder ?? copy?.choose_folder ?? "Choose folder")}
             </Button>
           </>
         )}

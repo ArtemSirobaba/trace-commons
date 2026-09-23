@@ -97,11 +97,13 @@ export async function getWitnessReviewSupport(): Promise<boolean> {
 export async function prepareAdmissionSession(
   entryId: string,
   backend: string,
+  confirmed: boolean,
 ): Promise<AdmissionPreparation> {
   const response = record(
     await invokeTauri("prepare_admission_session", {
       entryId,
       backend,
+      confirmed,
     }),
     "admission",
   );
@@ -115,9 +117,13 @@ export async function prepareAdmissionSession(
 
 export async function requestWitnessReview(
   entryId: string,
+  rawSessionConfirmed: boolean,
 ): Promise<WitnessReview> {
   const response = record(
-    await invokeTauri("witness_preview_request", { entryId }),
+    await invokeTauri("witness_preview_request", {
+      entryId,
+      rawSessionConfirmed,
+    }),
     "witness review",
   );
   const rendered =

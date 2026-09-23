@@ -143,6 +143,13 @@ export async function getHistoryData(): Promise<HistoryData> {
   };
 }
 
+export async function requestHistoryRefresh(): Promise<void> {
+  const response = record(await invokeTauri("request_history_refresh"));
+  if (response.requested !== true) {
+    throw new Error("History refresh was not requested");
+  }
+}
+
 function nullableString(value: Record<string, unknown>, key: string) {
   if (value[key] === null || value[key] === undefined) return null;
   return stringField(value, key);

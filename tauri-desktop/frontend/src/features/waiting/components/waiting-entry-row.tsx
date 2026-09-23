@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { useEligibilityCopy } from "../../../lib/tauri/use-contributor-copy";
 import type { WaitingEntry } from "../types";
 
 export function WaitingEntryRow({
@@ -10,6 +11,10 @@ export function WaitingEntryRow({
   selected?: boolean;
   onReview?: () => void;
 }) {
+  const eligibility = useEligibilityCopy(
+    entry.eligibility,
+    entry.eligibility_reason,
+  );
   const size = `${Math.max(1, Math.round(entry.size_bytes / 1024))} KB`;
   const detail =
     entry.subagent_count > 0
@@ -48,6 +53,19 @@ export function WaitingEntryRow({
               </small>
             )}
           </div>
+        )}
+        {entry.eligibility && eligibility.data && (
+          <div className="grid gap-0.5 text-[10px] leading-[1.45] text-muted-foreground">
+            <small>{eligibility.data.state_line}</small>
+            {eligibility.data.reason_line && (
+              <small>{eligibility.data.reason_line}</small>
+            )}
+          </div>
+        )}
+        {entry.eligibility && eligibility.isError && (
+          <small className="text-[10px] text-destructive">
+            Eligibility details unavailable.
+          </small>
         )}
         {entry.session_path && <small>{entry.session_path}</small>}
       </div>

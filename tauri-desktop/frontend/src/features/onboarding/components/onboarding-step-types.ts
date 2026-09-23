@@ -19,7 +19,7 @@ export type OnboardingStepProps = {
   alreadyEnrolled: boolean;
   initialInvite?: string | null;
   busy: boolean;
-  showPrivacy: boolean;
+  showPrivacy: boolean | null;
   onOpenScrubDisclosure: () => void;
   onComplete: () => void;
 };

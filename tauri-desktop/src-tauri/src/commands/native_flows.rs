@@ -63,7 +63,68 @@ pub(crate) async fn native_wallet_flow(
         "ingest_url": commons.trim(),
         "account_id": account.trim(),
     });
-    call_daemon(shared_state(&state)?, "native_wallet_flow", params).await
+    let result = call_daemon(shared_state(&state)?, "native_wallet_flow", params).await?;
+    if action == "start" {
+        state
+            .inner()
+            .authorize_wallet_url(result.get("browser_url").and_then(Value::as_str))?;
+    } else if action == "cancel" {
+        state.inner().authorize_wallet_url(None)?;
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub(crate) fn contributor_disclosure_copy() -> Value {
+    let witness = trace_commons_contributor::witness_copy::witness_copy();
+    let inference = trace_commons_contributor::private_inference_copy::private_inference_copy();
+    let source_checks = ["claude", "codex", "gemini", "cline", "opencode"]
+        .into_iter()
+        .filter_map(|key| {
+            trace_commons_contributor::source_copy::SourceTool::from_key(key).map(|tool| {
+                (key.to_owned(), json!({
+                    "watch": trace_commons_contributor::source_copy::source_check_line(tool, "watch"),
+                    "unset": trace_commons_contributor::source_copy::source_check_line(tool, "unset"),
+                    "off": trace_commons_contributor::source_copy::source_check_line(tool, "off"),
+                }))
+            })
+        })
+        .collect::<serde_json::Map<String, Value>>();
+    json!({
+        "witness_review": witness.review,
+        "wallet": witness.wallet,
+        "admission": witness.admission,
+        "onboarding": witness.onboarding,
+        "onboarding_shell": trace_commons_contributor::onboarding_copy::onboarding_copy(),
+        "source_settings": trace_commons_contributor::source_copy::source_settings_copy(),
+        "source_check_lines": source_checks,
+        "insights_ui": trace_commons_contributor::insights::service::ui_copy(),
+        "mission_drafts_ui": trace_commons_contributor::mission_draft_service::ui_copy(),
+        "history_ui": {
+            "held_row_body": trace_commons_contributor::history_copy::HELD_ROW_BODY,
+        },
+        "outcome": trace_commons_contributor::outcome_copy::outcome_copy(),
+        "private_inference": {
+            "offer_title": inference.offer_title,
+            "offer_what": inference.offer_what,
+            "offer_exposure": inference.offer_exposure,
+            "offer_no_repoint": inference.offer_no_repoint,
+            "offer_accept": inference.offer_accept,
+            "offer_decline": inference.offer_decline,
+            "offer_asked_once": inference.offer_asked_once,
+        },
+        "credential_cost": trace_commons_contributor::private_inference_copy::CREDENTIAL_COST,
+        "credential_wallet_notice": trace_commons_contributor::private_inference_copy::CREDENTIAL_WALLET_NOTICE,
+        "near_ai_enroll_title": inference.near_ai_enroll_title,
+        "near_ai_enroll_what": inference.near_ai_enroll_what,
+        "near_ai_enroll_action": inference.near_ai_enroll_action,
+        "near_ai_enroll_needs_login": inference.near_ai_enroll_needs_login,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn witness_review_copy() -> Value {
+    json!(trace_commons_contributor::witness_copy::witness_copy().review)
 }
 
 #[tauri::command]
@@ -92,16 +153,20 @@ pub(crate) async fn prepare_admission_session(
     state: State<'_, AppState>,
     entry_id: String,
     backend: String,
+    confirmed: bool,
 ) -> Result<Value, String> {
     required(&entry_id, "admission-entry-required")?;
     required(&backend, "admission-backend-required")?;
+    if !confirmed {
+        return Err("admission-confirmation-required".to_owned());
+    }
     call_result_or_view(
         shared_state(&state)?,
         "prepare_admission_session",
         json!({
             "entry_id": entry_id.trim(),
             "backend": backend.trim(),
-            "confirmed": true,
+            "confirmed": confirmed,
         }),
     )
     .await
@@ -124,14 +189,18 @@ pub(crate) async fn witness_preview_support(state: State<'_, AppState>) -> Resul
 pub(crate) async fn witness_preview_request(
     state: State<'_, AppState>,
     entry_id: String,
+    raw_session_confirmed: bool,
 ) -> Result<Value, String> {
     required(&entry_id, "witness-entry-required")?;
+    if !raw_session_confirmed {
+        return Err("witness-raw-session-confirmation-required".to_owned());
+    }
     call_result_or_view(
         shared_state(&state)?,
         "witness_preview_request",
         json!({
             "entry_id": entry_id.trim(),
-            "raw_session_confirmed": true,
+            "raw_session_confirmed": raw_session_confirmed,
         }),
     )
     .await

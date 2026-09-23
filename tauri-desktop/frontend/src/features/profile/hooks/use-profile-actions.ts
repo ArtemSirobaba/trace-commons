@@ -13,11 +13,12 @@ export function useProfileActions() {
     "idle" | "publishing" | "withdrawing" | "error"
   >("idle");
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const publishMutation = useMutation({
     mutationFn: ({ handle, bio }: { handle: string; bio: string }) =>
       publishProfile(handle, bio.trim() || null),
-    onSuccess: async () => {
+    onSuccess: async ({ profile }) => {
       await Promise.all([
         queryClient.invalidateQueries({
           queryKey: profileKeys.public(core.scope),
@@ -27,6 +28,7 @@ export function useProfileActions() {
           queryKey: settingsKeys.snapshot(core.scope),
         }),
       ]);
+      queryClient.setQueryData(profileKeys.public(core.scope), profile);
     },
   });
   const withdrawMutation = useMutation({
@@ -49,26 +51,37 @@ export function useProfileActions() {
     if (!cleanHandle) {
       setState("error");
       setError("Handle is required.");
+      setNotice(null);
       return false;
     }
     setState("publishing");
     setError(null);
+    setNotice(null);
     try {
-      await publishMutation.mutateAsync({ handle: cleanHandle, bio });
+      const result = await publishMutation.mutateAsync({
+        handle: cleanHandle,
+        bio,
+      });
       setState("idle");
-      return true;
+      if (!result.handlePersisted) {
+        setNotice(
+          "Profile is public, but this device could not save its local copy. It may disappear here after refresh or restart.",
+        );
+      }
+      return result;
     } catch {
       setState("error");
       setError(
         "Profile was not published. Check local enrollment and network access.",
       );
-      return false;
+      return null;
     }
   }
 
   async function withdraw() {
     setState("withdrawing");
     setError(null);
+    setNotice(null);
     try {
       await withdrawMutation.mutateAsync();
       setState("idle");
@@ -83,6 +96,7 @@ export function useProfileActions() {
   return {
     state,
     error,
+    notice,
     publish,
     withdraw,
     isPending: publishMutation.isPending || withdrawMutation.isPending,

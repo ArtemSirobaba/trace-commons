@@ -1,13 +1,8 @@
 use std::collections::BTreeSet;
-#[cfg(unix)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-#[cfg(unix)]
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Context;
 use serde_json::Value;
 use tauri::{Emitter, Manager, Runtime};
 use trace_commons_contributor::daemon::ipc::{
@@ -197,7 +192,6 @@ fn handle_daemon_event<R: Runtime>(app: &tauri::AppHandle<R>, event: Event) {
     schedule_digest_notification(app, event);
 }
 
-#[cfg(unix)]
 fn wait_for_event_retry(stop: &AtomicBool, delay: Duration) -> bool {
     for _ in 0..delay.as_secs() {
         if stop.load(Ordering::Acquire) {
@@ -208,7 +202,24 @@ fn wait_for_event_retry(stop: &AtomicBool, delay: Duration) -> bool {
     !stop.load(Ordering::Acquire)
 }
 
-#[cfg(unix)]
+fn start_daemon_recovery<R: Runtime>(app: tauri::AppHandle<R>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let stop = app.state::<AppState>().event_stop();
+        let mut delay = Duration::from_secs(1);
+        loop {
+            if !wait_for_event_retry(&stop, delay) {
+                return;
+            }
+            let state = app.state::<AppState>();
+            if tauri::async_runtime::block_on(runtime::ensure_daemon_started(&state)).is_ok() {
+                start_event_bridge(app.clone());
+                return;
+            }
+            delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+        }
+    });
+}
+
 fn supervise_attached_events<R: Runtime>(
     app: tauri::AppHandle<R>,
     daemon: Arc<trace_commons_contributor::daemon::attached::AttachedDaemon>,
@@ -280,23 +291,28 @@ pub(crate) fn start_event_bridge<R: Runtime>(app: tauri::AppHandle<R>) {
     let stop = state.event_stop();
     let event_app = app.clone();
     let started = match daemon {
-        DaemonConnection::Embedded(shared) => std::thread::Builder::new()
-            .name("tc-embedded-events".to_owned())
-            .spawn(move || {
+        DaemonConnection::Embedded(shared) => {
+            tauri::async_runtime::spawn(async move {
                 let mut events = shared.events.subscribe();
                 loop {
                     if stop.load(std::sync::atomic::Ordering::Acquire) {
                         break;
                     }
-                    if let Ok(event) = events.try_recv() {
-                        handle_daemon_event(&event_app, event);
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    match events.recv().await {
+                        Ok(event) => handle_daemon_event(&event_app, event),
+                        Err(_) if events.is_closed() => break,
+                        Err(_) => {
+                            let _ = event_app.emit(
+                                "daemon-event",
+                                serde_json::json!({ "event": EVENT_RESYNC_REQUIRED }),
+                            );
+                        }
                     }
                 }
-            })
-            .is_ok(),
-        #[cfg(unix)]
+                event_app.state::<AppState>().release_event_bridge();
+            });
+            true
+        }
         DaemonConnection::Attached(daemon) => {
             supervise_attached_events(app.clone(), daemon, stop);
             true
@@ -330,13 +346,37 @@ pub(crate) fn run() {
         }))
         .plugin(tauri_plugin_deep_link::init());
 
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(|app| {
+            use tauri::menu::{Menu, MenuItem, MenuItemKind};
+
+            let menu = Menu::default(app)?;
+            if let Some(MenuItemKind::Submenu(app_menu)) = menu.items()?.into_iter().next() {
+                let items = app_menu.items()?;
+                if !items.is_empty() {
+                    app_menu.remove_at(items.len() - 1)?;
+                }
+                app_menu.append(&MenuItem::with_id(
+                    app,
+                    "request_quit",
+                    format!("Quit {}", app.package_info().name),
+                    true,
+                    Some("CmdOrCtrl+Q"),
+                )?)?;
+            }
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == "request_quit" {
+                let _ = app.emit("quit-requested", ());
+            }
+        });
+
     builder
         .setup(|app| {
-            let state_dir = app
-                .path()
-                .app_data_dir()
-                .context("resolving Trace Commons application data directory")?;
-            let runtime = runtime::start_runtime(state_dir)?;
+            let runtime = runtime::start_runtime()?;
+            let recover_daemon = runtime.daemon_recovery_needed();
             let state = app.state::<AppState>();
             state
                 .install(runtime)
@@ -379,6 +419,9 @@ pub(crate) fn run() {
             native::configure_notifications();
             tray::setup_tray(app)?;
             start_event_bridge(app.handle().clone());
+            if recover_daemon {
+                start_daemon_recovery(app.handle().clone());
+            }
             tray::start_tray_refresh(app.handle().clone());
             Ok(())
         })
@@ -386,6 +429,7 @@ pub(crate) fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build Tauri desktop app")
         .run(|app_handle, event| match event {
+            #[cfg(target_os = "macos")]
             tauri::RunEvent::Opened { urls } => {
                 for url in urls {
                     remember_deep_link(app_handle, url.as_str());
@@ -398,15 +442,7 @@ pub(crate) fn run() {
                     let _ = window.set_focus();
                 }
             }
-            tauri::RunEvent::ExitRequested { api, code, .. } => {
-                let state = app_handle.state::<AppState>();
-                let authorized = code.is_some() && state.consume_authorized_exit();
-                if !authorized {
-                    api.prevent_exit();
-                    let _ = app_handle.emit("quit-requested", ());
-                }
-            }
-            tauri::RunEvent::Exit { .. } => {
+            tauri::RunEvent::Exit => {
                 runtime::stop_runtime(&app_handle.state::<AppState>());
             }
             _ => {}

@@ -111,8 +111,8 @@ export async function nativeWalletFlow(input: {
   );
 }
 
-export async function openNativeWalletUrl(url: string, commons: string) {
-  return invokeTauriVoid("open_native_wallet_url", { url, commons });
+export async function openNativeWalletUrl(url: string) {
+  return invokeTauriVoid("open_native_wallet_url", { url });
 }
 
 export async function nearAiAccountEnroll(commons: string) {

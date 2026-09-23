@@ -1,5 +1,4 @@
 import { useMemo, useState } from "react";
-import { Button } from "@/components/ui/button";
 import { PageHeader } from "../../components/page-header";
 import { StatCard } from "../../components/stat-card";
 import { CommunityPanel } from "./components/community-panel";
@@ -10,6 +9,7 @@ import {
   HistoryFilterBar,
 } from "./components/history-filter";
 import { HistoryRow } from "./components/history-row";
+import { HistoryRefreshControl } from "./components/history-refresh-control";
 import { PublicRunEditor } from "./components/public-run-editor";
 import { SkillLearningPanel } from "./components/skill-learning-panel";
 import {
@@ -21,6 +21,7 @@ import {
 import { useHistoryData } from "./hooks/use-history-data";
 import { useHistoryDetail } from "./hooks/use-history-detail";
 import { useHistoryWithdrawal } from "./hooks/use-history-withdrawal";
+import { useContributorDisclosureCopy } from "../../lib/tauri/use-contributor-copy";
 
 export function HistoryPage() {
   const history = useHistoryData();
@@ -28,6 +29,8 @@ export function HistoryPage() {
   const records = history.data?.history ?? [];
   const detail = useHistoryDetail();
   const withdrawal = useHistoryWithdrawal();
+  const contributorCopy = useContributorDisclosureCopy();
+  const heldRowFallback = contributorCopy.data?.history_ui.held_row_body ?? null;
   const [filter, setFilter] = useState<HistoryFilter>("all");
   const counts = useMemo(() => countHistory(records), [records]);
   const visibleRecords = useMemo(
@@ -39,8 +42,8 @@ export function HistoryPage() {
     [visibleRecords],
   );
   const explanations = useMemo(
-    () => quarantineExplanations(records),
-    [records],
+    () => quarantineExplanations(records, heldRowFallback),
+    [heldRowFallback, records],
   );
   return (
     <div className="mx-auto max-w-[1080px] px-4 pb-12 pt-8 sm:px-8 sm:pb-16 sm:pt-10 lg:px-16 lg:pt-14">
@@ -70,13 +73,13 @@ export function HistoryPage() {
           tone="blue"
         />
         <StatCard
-          label="Credit"
-          value={
+          label="Final credit points"
+          value={rollup ? `${rollup.credit_final.toFixed(1)}` : "—"}
+          detail={
             rollup
-              ? `${(rollup.credit_final + rollup.credit_pending).toFixed(1)}`
-              : "—"
+              ? `Final: ${rollup.credit_final.toFixed(1)} · Pending: ${rollup.credit_pending.toFixed(1)} · not currency`
+              : "Final and pending credit points; not currency"
           }
-          detail="Signed record, not currency"
           tone="gold"
         />
       </div>
@@ -89,14 +92,7 @@ export function HistoryPage() {
             </span>
             <h2>Contribution history</h2>
           </div>
-          <Button
-            className="border-0 bg-transparent p-0 text-[11px] font-bold text-primary"
-            type="button"
-            onClick={() => void history.refresh()}
-            disabled={history.state === "loading"}
-          >
-            Refresh
-          </Button>
+          <HistoryRefreshControl />
         </div>
         {history.state === "loading" && (
           <p className="mt-[30px] mb-1 text-[13px] text-muted-foreground">
@@ -148,6 +144,15 @@ export function HistoryPage() {
                         <HistoryRow
                           key={item.submission_id}
                           record={item}
+                          accountSignedIn={withdrawal.accountSignedIn}
+                          accountStatusPending={withdrawal.accountStatusPending}
+                          accountSignInPending={withdrawal.accountSignInPending}
+                          accountSignInUrlAvailable={Boolean(withdrawal.accountSignInUrl)}
+                          accountSignInError={withdrawal.accountSignInError}
+                          openingSignInUrl={withdrawal.openingSignInUrl}
+                          onAccountSignIn={withdrawal.startSignIn}
+                          onOpenSignInUrl={() => void withdrawal.openSignInUrl()}
+                          heldRowFallback={heldRowFallback}
                           onOpen={() => void detail.open(item.submission_id)}
                           confirming={
                             withdrawal.confirmingId === item.submission_id
@@ -199,6 +204,11 @@ export function HistoryPage() {
                 {explanation}
               </p>
             ))}
+            {explanations.length === 0 && !heldRowFallback && (
+              <p className="m-0 text-[11px] leading-[1.55] text-muted-foreground">
+                Shared hold explanation unavailable.
+              </p>
+            )}
           </section>
         )}
       <HistoryDetailView detail={detail.data} state={detail.state} />

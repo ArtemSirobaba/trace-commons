@@ -303,10 +303,7 @@ pub(crate) fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
 pub(crate) fn start_tray_refresh<R: TauriRuntime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn_blocking(move || {
         let mut previous: Option<TraySnapshot> = None;
-        loop {
-            let Some(state) = app.try_state::<AppState>() else {
-                break;
-            };
+        while let Some(state) = app.try_state::<AppState>() {
             if state.event_stopped() {
                 break;
             }

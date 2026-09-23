@@ -2195,6 +2195,18 @@ pub fn handle_request(shared: &DaemonShared, req: &Request) -> Response {
         "refresh_history" => {
             // The poller owns the network. This only asks it to run sooner,
             // and says so rather than queueing an unbounded number of asks.
+            let mut state = shared.state.lock().expect("state lock");
+            let now = chrono::Utc::now();
+            if !state.history_refresh_due_at.is_some_and(|due| due <= now) {
+                state.history_refresh_due_at = Some(now);
+                if state.save(&shared.store).is_err() {
+                    return Response::err(
+                        req.id,
+                        ERR_UNAVAILABLE,
+                        "history-refresh-request-failed",
+                    );
+                }
+            }
             Response::ok(req.id, serde_json::json!({ "requested": true }))
         }
         "token_storage_status" => handle_token_storage(shared, req),
@@ -5311,6 +5323,22 @@ mod tests {
         // borrows its path.
         std::mem::forget(_d);
         DaemonShared::load(store).unwrap()
+    }
+
+    #[test]
+    fn refresh_history_request_schedules_poll_without_postponing_earlier_request() {
+        let shared = shared();
+        let response = handle_request(&shared, &req("refresh_history", serde_json::json!({})));
+        assert_eq!(response.result.unwrap()["requested"], true);
+        let first_due = shared.state.lock().unwrap().history_refresh_due_at.unwrap();
+        assert!(first_due <= chrono::Utc::now());
+
+        let response = handle_request(&shared, &req("refresh_history", serde_json::json!({})));
+        assert_eq!(response.result.unwrap()["requested"], true);
+        assert_eq!(
+            shared.state.lock().unwrap().history_refresh_due_at,
+            Some(first_due)
+        );
     }
 
     /// A queue entry whose session file holds `body`, so

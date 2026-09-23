@@ -51,7 +51,7 @@ run_tauri() {
   elif command -v tauri >/dev/null 2>&1; then
     tauri "$@"
   else
-    pnpm dlx --yes @tauri-apps/cli@2 "$@"
+    pnpm dlx @tauri-apps/cli@2.11.5 "$@"
   fi
 }
 

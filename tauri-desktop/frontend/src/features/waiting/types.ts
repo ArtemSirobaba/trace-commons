@@ -36,6 +36,8 @@ export type WaitingEntry = {
 
 export type WaitingData = { pending: WaitingEntry[] };
 
+export type OutcomeVerdict = "worked" | "partly" | "failed";
+
 export type WaitingPreview = {
   would_send_bytes: number;
   raw_session_bytes: number;

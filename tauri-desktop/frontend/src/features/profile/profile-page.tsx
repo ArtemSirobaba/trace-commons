@@ -39,8 +39,8 @@ export function ProfilePage({
   ]);
   const publishCurrent = async () => {
     const values = form.getValues();
-    const published = await actions.publish(values.handle, values.bio);
-    if (published) {
+    const result = await actions.publish(values.handle, values.bio);
+    if (result) {
       form.reset(values);
       setSaved(true);
     }
@@ -74,6 +74,7 @@ export function ProfilePage({
           saved={saved}
           actionState={actions.state}
           actionError={actions.error}
+          actionNotice={actions.notice}
           published={publicProfile?.on_roster ?? false}
           onSave={() => setSaved(true)}
           onPublish={() => {

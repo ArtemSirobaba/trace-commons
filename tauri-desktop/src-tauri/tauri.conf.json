@@ -47,6 +47,6 @@
   },
   "bundle": {
     "active": false,
-    "icon": ["../assets/trace-commons.png"]
+    "icon": ["../assets/trace-commons.ico", "../assets/trace-commons.png"]
   }
 }

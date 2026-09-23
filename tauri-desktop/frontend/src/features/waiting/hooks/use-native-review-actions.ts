@@ -24,11 +24,13 @@ export function useNativeReviewActions(
     queryFn: getWitnessReviewSupport,
     enabled: core.isSuccess && !hasCertificate,
   });
-  const admission = useMutation<AdmissionPreparation, Error, void>({
-    mutationFn: () => prepareAdmissionSession(entryId, backend.trim()),
+  const admission = useMutation<AdmissionPreparation, Error, boolean>({
+    mutationFn: (confirmed) =>
+      prepareAdmissionSession(entryId, backend.trim(), confirmed),
   });
-  const review = useMutation<WitnessReview, Error, void>({
-    mutationFn: () => requestWitnessReview(entryId),
+  const review = useMutation<WitnessReview, Error, boolean>({
+    mutationFn: (rawSessionConfirmed) =>
+      requestWitnessReview(entryId, rawSessionConfirmed),
     onSuccess: (result) => {
       if (result.ready) onReviewed();
     },

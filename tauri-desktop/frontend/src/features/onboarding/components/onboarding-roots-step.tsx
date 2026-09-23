@@ -1,4 +1,5 @@
 import { Button } from "@/components/ui/button";
+import { useContributorDisclosureCopy } from "../../../lib/tauri/use-contributor-copy";
 import { SourceRootsPanel } from "../../settings/public";
 import type { OnboardingStepProps } from "./onboarding-step-types";
 
@@ -8,6 +9,8 @@ export function OnboardingRootsStep({
   roots,
   busy,
 }: Pick<OnboardingStepProps, "onboarding" | "settings" | "roots" | "busy">) {
+  const disclosure = useContributorDisclosureCopy();
+  const rootsReady = Boolean(disclosure.data?.source_settings);
   return (
     <>
       <SourceRootsPanel
@@ -34,7 +37,12 @@ export function OnboardingRootsStep({
           className="rounded-lg border-0 bg-primary px-3.5 py-2.5 text-[12px] font-bold text-primary-foreground hover:bg-primary/80"
           type="button"
           onClick={onboarding.continueRoots}
-          disabled={busy || roots.busy || settings.state !== "ready"}
+          disabled={
+            busy ||
+            roots.busy ||
+            settings.state !== "ready" ||
+            !rootsReady
+          }
         >
           Continue
         </Button>

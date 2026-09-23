@@ -1,9 +1,22 @@
 import { Button } from "@/components/ui/button";
+import { isTauriRuntime } from "../../../lib/tauri/core-api";
+import { canWithdrawStatus, historyStatusLabel } from "../withdrawal-eligibility";
+import { contributorFacingExplanations } from "../history-view-model";
 import type { HistoryRecord, WithdrawalResult } from "../types";
+import { AccountSignInControl } from "./account-sign-in-control";
 import { WithdrawalControl } from "./withdrawal-control";
 
 export function HistoryRow({
   record,
+  accountSignedIn,
+  accountStatusPending,
+  accountSignInPending,
+  accountSignInUrlAvailable,
+  accountSignInError,
+  openingSignInUrl,
+  onAccountSignIn,
+  onOpenSignInUrl,
+  heldRowFallback,
   onOpen,
   confirming,
   busy,
@@ -14,6 +27,15 @@ export function HistoryRow({
   onWithdrawCancel,
 }: {
   record: HistoryRecord;
+  accountSignedIn?: boolean;
+  accountStatusPending?: boolean;
+  accountSignInPending?: boolean;
+  accountSignInUrlAvailable?: boolean;
+  accountSignInError?: string | null;
+  openingSignInUrl?: boolean;
+  onAccountSignIn?: () => void;
+  onOpenSignInUrl?: () => void;
+  heldRowFallback?: string | null;
   onOpen?: () => void;
   confirming?: boolean;
   busy?: boolean;
@@ -27,9 +49,17 @@ export function HistoryRow({
     month: "short",
     day: "numeric",
   });
-  const status = record.status.replaceAll("_", " ");
+  const status = historyStatusLabel(record.status);
+  const canWithdraw = canWithdrawStatus(record.status);
+  const visibleExplanations = contributorFacingExplanations(record.explanations);
+  const rowExplanations =
+    record.status === "quarantined" && visibleExplanations.length === 0
+      ? heldRowFallback
+        ? [heldRowFallback]
+        : []
+      : visibleExplanations;
   return (
-    <article className="grid grid-cols-[38px_minmax(0,1fr)_auto_auto] items-center gap-3.5 border-b border-border py-3.5 max-[860px]:grid-cols-[38px_minmax(0,1fr)_auto]">
+    <article className="grid grid-cols-[38px_minmax(0,1fr)_auto] items-center gap-3.5 border-b border-border py-3.5">
       <div className="grid h-[34px] w-[34px] place-items-center rounded-[9px] bg-primary text-[12px] font-extrabold text-primary-foreground bg-blue">
         {record.project_label.slice(0, 1).toUpperCase()}
       </div>
@@ -38,13 +68,16 @@ export function HistoryRow({
         <span>
           {record.source} · {date}
         </span>
-      </div>
-      <div className="grid min-w-[116px] gap-1 text-right max-[860px]:hidden">
-        <strong>{status}</strong>
-        <span>
-          {record.credit_points_final ?? record.credit_points_pending} credit
-          points
-        </span>
+        <small>Status: {status}</small>
+        {rowExplanations.map((explanation) => (
+          <small className="text-muted-foreground" key={explanation}>
+            {explanation}
+          </small>
+        ))}
+        <small>
+          Final credit: {formatCredit(record.credit_points_final)} · Pending
+          credit: {formatCredit(record.credit_points_pending)}
+        </small>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2">
         <Button
@@ -55,7 +88,7 @@ export function HistoryRow({
         >
           Open
         </Button>
-        {onWithdrawRequest && onWithdrawConfirm && onWithdrawCancel && (
+        {canWithdraw && accountSignedIn === true && onWithdrawRequest && onWithdrawConfirm && onWithdrawCancel && (
           <WithdrawalControl
             record={record}
             confirming={Boolean(confirming)}
@@ -67,7 +100,23 @@ export function HistoryRow({
             onCancel={onWithdrawCancel}
           />
         )}
+        {canWithdraw && accountSignedIn !== true && (
+          <AccountSignInControl
+            checking={Boolean(accountStatusPending)}
+            pending={Boolean(accountSignInPending)}
+            openingFallback={Boolean(openingSignInUrl)}
+            canSignIn={isTauriRuntime()}
+            signInUrlAvailable={Boolean(accountSignInUrlAvailable)}
+            error={accountSignInError ?? null}
+            onSignIn={onAccountSignIn}
+            onOpenFallback={onOpenSignInUrl}
+          />
+        )}
       </div>
     </article>
   );
+}
+
+function formatCredit(value: number | null) {
+  return value === null ? "not issued" : value.toFixed(1);
 }

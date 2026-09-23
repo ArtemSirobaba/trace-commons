@@ -105,8 +105,7 @@ int tc_macos_request_notification_permission(void) {
                 granted = did_grant && error == nil;
                 dispatch_semaphore_signal(semaphore);
             }];
-        dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(TC_TIMEOUT * NSEC_PER_SEC));
-        if (dispatch_semaphore_wait(semaphore, deadline) != 0) return -1;
+        dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
         return granted ? 1 : 0;
     }
 }

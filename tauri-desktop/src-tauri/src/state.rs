@@ -13,15 +13,23 @@ use trace_commons_contributor::{
     daemon::{
         EmbeddedDaemon,
         attached::AttachedDaemon,
-        ipc::{DaemonShared, Response},
+        ipc::{DaemonShared, EVENT_RESYNC_REQUIRED, Event, Response},
     },
 };
 
 #[derive(Clone)]
 pub(crate) enum DaemonConnection {
     Embedded(Arc<DaemonShared>),
-    #[cfg(unix)]
     Attached(Arc<AttachedDaemon>),
+}
+
+impl DaemonConnection {
+    pub(crate) fn is_alive(&self) -> bool {
+        match self {
+            Self::Embedded(_) => true,
+            Self::Attached(daemon) => !daemon.is_closed(),
+        }
+    }
 }
 
 pub(crate) struct Runtime {
@@ -29,20 +37,27 @@ pub(crate) struct Runtime {
     connection: Option<DaemonConnection>,
     compute: Arc<ComputeController>,
     daemon: Option<EmbeddedDaemon>,
+    daemon_unavailable: bool,
 }
 
 impl Runtime {
+    pub(crate) fn daemon_recovery_needed(&self) -> bool {
+        self.daemon_unavailable
+    }
+
     pub(crate) fn new(
         state_dir: PathBuf,
         connection: Option<DaemonConnection>,
         compute: Arc<ComputeController>,
         daemon: Option<EmbeddedDaemon>,
+        daemon_unavailable: bool,
     ) -> Self {
         Self {
             state_dir,
             connection,
             compute,
             daemon,
+            daemon_unavailable,
         }
     }
 
@@ -53,8 +68,11 @@ impl Runtime {
                 DaemonConnection::Embedded(shared) => {
                     shared.shutdown.store(true, Ordering::Release);
                     shared.shutdown_signal.notify_one();
+                    let _ = shared.events.send(Event {
+                        event: EVENT_RESYNC_REQUIRED.to_owned(),
+                        data: serde_json::json!({}),
+                    });
                 }
-                #[cfg(unix)]
                 DaemonConnection::Attached(daemon) => daemon.close(),
             }
         }
@@ -67,10 +85,11 @@ impl Runtime {
 pub(crate) struct AppState {
     runtime: Mutex<Option<Runtime>>,
     pending_deep_link: Mutex<Option<String>>,
+    allowed_wallet_url: Mutex<Option<String>>,
+    allowed_account_sign_in_url: Mutex<Option<String>>,
     deep_link_state: Mutex<String>,
     event_stop: Arc<AtomicBool>,
     event_bridge_started: AtomicBool,
-    exit_authorized: AtomicBool,
 }
 
 impl Default for AppState {
@@ -78,15 +97,60 @@ impl Default for AppState {
         Self {
             runtime: Mutex::new(None),
             pending_deep_link: Mutex::new(None),
+            allowed_wallet_url: Mutex::new(None),
+            allowed_account_sign_in_url: Mutex::new(None),
             deep_link_state: Mutex::new("unknown".to_owned()),
             event_stop: Arc::new(AtomicBool::new(false)),
             event_bridge_started: AtomicBool::new(false),
-            exit_authorized: AtomicBool::new(false),
         }
     }
 }
 
 impl AppState {
+    pub(crate) fn authorize_wallet_url(&self, url: Option<&str>) -> Result<(), String> {
+        let mut slot = self
+            .allowed_wallet_url
+            .lock()
+            .map_err(|_| "application state lock poisoned".to_owned())?;
+        *slot = url.map(str::to_owned);
+        Ok(())
+    }
+
+    pub(crate) fn consume_wallet_url(&self, url: &str) -> Result<bool, String> {
+        let mut slot = self
+            .allowed_wallet_url
+            .lock()
+            .map_err(|_| "application state lock poisoned".to_owned())?;
+        if slot.as_deref() == Some(url) {
+            slot.take();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub(crate) fn authorize_account_sign_in_url(&self, url: Option<&str>) -> Result<(), String> {
+        let mut slot = self
+            .allowed_account_sign_in_url
+            .lock()
+            .map_err(|_| "application state lock poisoned".to_owned())?;
+        *slot = url.map(str::to_owned);
+        Ok(())
+    }
+
+    pub(crate) fn consume_account_sign_in_url(&self, url: &str) -> Result<bool, String> {
+        let mut slot = self
+            .allowed_account_sign_in_url
+            .lock()
+            .map_err(|_| "application state lock poisoned".to_owned())?;
+        if slot.as_deref() == Some(url) {
+            slot.take();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     pub(crate) fn install(&self, runtime: Runtime) -> Result<(), ()> {
         let mut slot = self.runtime.lock().map_err(|_| ())?;
         *slot = Some(runtime);
@@ -98,10 +162,11 @@ impl AppState {
             .runtime
             .lock()
             .map_err(|_| "application state lock poisoned".to_owned())?;
-        Ok(runtime
+        runtime
             .as_ref()
             .and_then(|runtime| runtime.connection.clone())
-            .ok_or_else(|| "Rust core daemon is not started; choose source roots".to_owned())?)
+            .filter(|connection| connection.is_alive())
+            .ok_or_else(|| "Rust core daemon is not started; choose source roots".to_owned())
     }
 
     pub(crate) fn optional_daemon(&self) -> Result<Option<DaemonConnection>, String> {
@@ -111,7 +176,8 @@ impl AppState {
             .map_err(|_| "application state lock poisoned".to_owned())?;
         Ok(runtime
             .as_ref()
-            .and_then(|runtime| runtime.connection.clone()))
+            .and_then(|runtime| runtime.connection.clone())
+            .filter(DaemonConnection::is_alive))
     }
 
     pub(crate) fn state_directory(&self) -> Result<PathBuf, String> {
@@ -130,33 +196,36 @@ impl AppState {
         shared: Arc<DaemonShared>,
         daemon: EmbeddedDaemon,
     ) -> Result<(), String> {
-        let mut runtime = self
+        let mut slot = self
             .runtime
             .lock()
             .map_err(|_| "application state lock poisoned".to_owned())?;
-        let runtime = runtime
+        let runtime = slot
             .as_mut()
             .ok_or_else(|| "Rust core is not started".to_owned())?;
-        let replace_closed_attachment = match runtime.connection.as_ref() {
-            None => true,
-            #[cfg(unix)]
-            Some(DaemonConnection::Attached(attached)) => attached.is_closed(),
-            _ => false,
-        };
-        if replace_closed_attachment {
-            runtime.connection = Some(DaemonConnection::Embedded(shared));
-            runtime.daemon = Some(daemon);
+        if matches!(runtime.connection, Some(DaemonConnection::Embedded(_))) {
+            drop(slot);
+            daemon.close();
+            return Ok(());
+        }
+        let previous = runtime
+            .connection
+            .replace(DaemonConnection::Embedded(shared));
+        runtime.daemon = Some(daemon);
+        runtime.daemon_unavailable = false;
+        drop(slot);
+        if let Some(DaemonConnection::Attached(attached)) = previous {
+            attached.close();
         }
         Ok(())
     }
 
-    #[cfg(unix)]
     pub(crate) fn attach_external_daemon(&self, daemon: Arc<AttachedDaemon>) -> Result<(), String> {
-        let mut runtime = self
+        let mut slot = self
             .runtime
             .lock()
             .map_err(|_| "application state lock poisoned".to_owned())?;
-        let runtime = runtime
+        let runtime = slot
             .as_mut()
             .ok_or_else(|| "Rust core is not started".to_owned())?;
         let replace_closed_attachment = match runtime.connection.as_ref() {
@@ -164,8 +233,20 @@ impl AppState {
             Some(DaemonConnection::Attached(attached)) => attached.is_closed(),
             Some(DaemonConnection::Embedded(_)) => false,
         };
-        if replace_closed_attachment {
-            runtime.connection = Some(DaemonConnection::Attached(daemon));
+        let previous = if replace_closed_attachment {
+            runtime.daemon_unavailable = false;
+            runtime
+                .connection
+                .replace(DaemonConnection::Attached(Arc::clone(&daemon)))
+        } else {
+            None
+        };
+        drop(slot);
+        if !replace_closed_attachment {
+            daemon.close();
+        }
+        if let Some(DaemonConnection::Attached(attached)) = previous {
+            attached.close();
         }
         Ok(())
     }
@@ -198,10 +279,9 @@ impl AppState {
         };
         match connection {
             DaemonConnection::Embedded(shared) => Ok(Some(shared.status_value())),
-            #[cfg(unix)]
             DaemonConnection::Attached(daemon) => Ok(Some(Self::response_value(
                 daemon
-                    .call("status", &serde_json::json!({}))
+                    .call_with_timeout("status", &serde_json::json!({}), Duration::from_secs(3))
                     .map_err(|error| error.to_string())?,
             )?)),
         }
@@ -217,20 +297,24 @@ impl AppState {
             .ok_or_else(|| "Rust core is not started".to_owned())?;
         let state_dir = runtime.state_dir.clone();
         let connection = runtime.connection.clone();
+        let daemon_unavailable = runtime.daemon_unavailable;
         drop(guard);
-        let daemon = Self::daemon_value(connection.clone())?.unwrap_or_else(|| {
-            serde_json::json!({
-                "schema_version": "not-started",
-                "logged_in": false,
-                "tenant_id": null,
-                "consent_scopes": [],
-                "paused": false,
-                "queue_depth": 0,
-                "health": { "last_error_label": null, "since": null },
-            })
-        });
-        let startup = if connection.is_some() {
+        let daemon = Self::daemon_value(connection.clone().filter(DaemonConnection::is_alive))?
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "schema_version": "not-started",
+                    "logged_in": false,
+                    "tenant_id": null,
+                    "consent_scopes": [],
+                    "paused": false,
+                    "queue_depth": 0,
+                    "health": { "last_error_label": null, "since": null },
+                })
+            });
+        let startup = if connection.as_ref().is_some_and(DaemonConnection::is_alive) {
             "running"
+        } else if daemon_unavailable || connection.is_some() {
+            "daemon_unavailable"
         } else {
             "needs_roots"
         };
@@ -271,14 +355,6 @@ impl AppState {
 
     pub(crate) fn event_stopped(&self) -> bool {
         self.event_stop.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn authorize_exit(&self) {
-        self.exit_authorized.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn consume_authorized_exit(&self) -> bool {
-        self.exit_authorized.swap(false, Ordering::AcqRel)
     }
 
     pub(crate) fn shutdown(&self) {
@@ -337,4 +413,55 @@ pub(crate) fn compute_command(
     command: ComputeCommand,
 ) -> Result<serde_json::Value, String> {
     state.inner().compute_command(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppState;
+
+    #[test]
+    fn wallet_url_authorization_is_exact_and_single_use() {
+        let state = AppState::default();
+        state
+            .authorize_wallet_url(Some("https://commons.example/wallet/start?state=1"))
+            .unwrap();
+        assert!(
+            !state
+                .consume_wallet_url("https://attacker.example/wallet/start?state=1")
+                .unwrap()
+        );
+        assert!(
+            state
+                .consume_wallet_url("https://commons.example/wallet/start?state=1")
+                .unwrap()
+        );
+        assert!(
+            !state
+                .consume_wallet_url("https://commons.example/wallet/start?state=1")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn account_sign_in_url_authorization_expires_after_use() {
+        let state = AppState::default();
+        state
+            .authorize_account_sign_in_url(Some("https://commons.example/account/start?once=1"))
+            .unwrap();
+        assert!(
+            !state
+                .consume_account_sign_in_url("https://other.example/account/start?once=1")
+                .unwrap()
+        );
+        assert!(
+            state
+                .consume_account_sign_in_url("https://commons.example/account/start?once=1")
+                .unwrap()
+        );
+        assert!(
+            !state
+                .consume_account_sign_in_url("https://commons.example/account/start?once=1")
+                .unwrap()
+        );
+    }
 }

@@ -1,11 +1,11 @@
 import { Button } from "@/components/ui/button";
 import {
   Field,
-  FieldDescription,
   FieldGroup,
   FieldLabel,
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
+import { useContributorDisclosureCopy } from "../../../lib/tauri/use-contributor-copy";
 import type { useOnboardingWallet } from "../hooks/use-onboarding-wallet";
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: This component renders the Rust-owned wallet lifecycle states and controls.
@@ -17,6 +17,7 @@ export function OnboardingWalletConnect({
   blocked?: boolean;
 }) {
   const flow = wallet.flow;
+  const disclosure = useContributorDisclosureCopy().data?.wallet;
   if (!flow || flow.state === "Unsupported") return null;
 
   return (
@@ -25,15 +26,17 @@ export function OnboardingWalletConnect({
         <span className="mb-3 block font-mono text-[10px] font-extrabold leading-none tracking-[.16em] text-primary">
           NEAR WALLET
         </span>
-        <h3>Connect with a NEAR wallet</h3>
+        <h3>{disclosure?.heading ?? "NEAR wallet signup"}</h3>
         <p className="m-0 text-[12px] leading-[1.55] text-muted-foreground">
-          Rust owns capability checks and ceremony state. The browser URL is
-          opened only after the daemon verifies its origin.
+          {disclosure?.disclosure ??
+            "Loading wallet connection disclosure…"}
         </p>
       </div>
       <FieldGroup>
         <Field>
-          <FieldLabel htmlFor="wallet-commons">Commons URL</FieldLabel>
+          <FieldLabel htmlFor="wallet-commons">
+            {disclosure?.commons ?? "Commons URL"}
+          </FieldLabel>
           <Input
             id="wallet-commons"
             value={wallet.commons}
@@ -41,13 +44,12 @@ export function OnboardingWalletConnect({
             placeholder="https://commons.example"
             disabled={wallet.pending || blocked || !flow.can_edit}
           />
-          <FieldDescription>
-            Used for capability check and signup.
-          </FieldDescription>
         </Field>
         {flow.can_start && (
           <Field>
-            <FieldLabel htmlFor="wallet-account">NEAR account</FieldLabel>
+            <FieldLabel htmlFor="wallet-account">
+              {disclosure?.account ?? "NEAR account"}
+            </FieldLabel>
             <Input
               id="wallet-account"
               value={wallet.account}
@@ -64,7 +66,9 @@ export function OnboardingWalletConnect({
             type="button"
             variant="outline"
             onClick={() => void wallet.run("check")}
-            disabled={wallet.pending || blocked || !wallet.commons.trim()}
+            disabled={
+              wallet.pending || blocked || !wallet.commons.trim() || !disclosure
+            }
           >
             Check wallet support
           </Button>
@@ -77,10 +81,11 @@ export function OnboardingWalletConnect({
               wallet.pending ||
               blocked ||
               !wallet.commons.trim() ||
-              !wallet.account.trim()
+              !wallet.account.trim() ||
+              !disclosure
             }
           >
-            {wallet.pending ? "Opening…" : "Start wallet signup"}
+            {wallet.pending ? "Opening…" : "Start signup"}
           </Button>
         )}
         {flow.can_cancel && (

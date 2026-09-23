@@ -4,11 +4,15 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useRef } from "react";
 import { useForm } from "react-hook-form";
 import { PageHeader } from "../../components/page-header";
+import { ConfirmActionButton } from "../../components/confirm-action-button";
+import { useContributorDisclosureCopy } from "../../lib/tauri/use-contributor-copy";
 import { type MissionImportFormValues, missionImportFormSchema } from "./forms";
 import { useMissionDrafts } from "./hooks/use-mission-drafts";
 
 export function MissionDraftsPage() {
   const drafts = useMissionDrafts();
+  const contributorCopy = useContributorDisclosureCopy();
+  const deleteCopy = contributorCopy.data?.mission_drafts_ui;
   const input = useRef<HTMLInputElement>(null);
   const form = useForm<MissionImportFormValues>({
     resolver: zodResolver(missionImportFormSchema),
@@ -133,14 +137,17 @@ export function MissionDraftsPage() {
             </div>
           </div>
           <div className="mt-[18px] flex justify-end gap-[9px]">
-            <Button
-              className="rounded-[7px] border border-border bg-background px-[11px] py-2 text-[11px] font-bold text-foreground hover:border-primary hover:text-primary text-destructive"
-              type="button"
-              onClick={() => void drafts.remove()}
-              disabled={drafts.state === "busy"}
-            >
-              Delete local draft
-            </Button>
+            <ConfirmActionButton
+              label={deleteCopy?.delete}
+              title={deleteCopy?.delete_confirm_title}
+              description={deleteCopy?.delete_confirm}
+              confirmLabel={deleteCopy?.delete}
+              cancelLabel={deleteCopy?.cancel}
+              workingLabel={deleteCopy?.working}
+              unavailableLabel="Delete confirmation copy unavailable. Reload before deleting."
+              busy={drafts.state === "busy"}
+              onConfirm={() => void drafts.remove()}
+            />
           </div>
         </section>
       )}

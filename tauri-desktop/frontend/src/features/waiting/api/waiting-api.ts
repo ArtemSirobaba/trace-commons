@@ -6,6 +6,7 @@ import type {
   WaitingData,
   WaitingEntry,
   WaitingPreview,
+  OutcomeVerdict,
 } from "../types";
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -257,12 +258,30 @@ function parseApproval(value: unknown) {
   } satisfies ApprovalResult;
 }
 
-export async function approveWaitingEntry(entryId: string) {
-  return parseApproval(await invokeTauri("approve_entry", { entryId }));
+export async function approveWaitingEntry(
+  entryId: string,
+  outcome?: OutcomeVerdict,
+  correction?: string,
+) {
+  return parseApproval(
+    await invokeTauri("approve_entry", {
+      entryId,
+      ...(outcome ? { outcome } : {}),
+      ...(correction !== undefined ? { correction } : {}),
+    }),
+  );
 }
 
-export async function approveWaitingProject(projectId: string) {
-  return parseApproval(await invokeTauri("approve_project", { projectId }));
+export async function approveWaitingProject(
+  projectId: string,
+  outcome?: OutcomeVerdict,
+) {
+  return parseApproval(
+    await invokeTauri("approve_project", {
+      projectId,
+      ...(outcome ? { outcome } : {}),
+    }),
+  );
 }
 
 export async function getQueueOutcomeCounts(): Promise<QueueOutcomeCounts> {

@@ -16,10 +16,11 @@ not establish native OS or release parity; current gates live in
 ```
 
 The development script runs Vite on port 1420 with Tauri reload. Build scripts
-install frontend dependencies from the frozen lockfile. Local state stays in
-Tauri's per-user app-data directory. Desktop launch does not require PostgreSQL
-or Docker.
+install frontend dependencies from the frozen lockfile. Contributor state
+uses the shared core directory, including `TRACE_COMMONS_CONTRIBUTOR_DIR`.
+Desktop launch does not require PostgreSQL or Docker.
 
-Bundle identifier remains `ai.tracecommons.tauri.prototype` during this move to
-preserve existing local app-data identity. Change it only with an explicit
-state-migration and release-identity decision.
+Development builds use bundle identifier
+`ai.tracecommons.tauri.prototype`; release packaging currently declares
+`ai.tracecommons.desktop`. Confirm final identity and any state migration
+before promoting packages. See [ARCHITECTURE.md](./ARCHITECTURE.md).

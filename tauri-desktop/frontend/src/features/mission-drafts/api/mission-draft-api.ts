@@ -1,4 +1,4 @@
-import { invokeTauri } from "../../../lib/tauri/core-api";
+import { invokeTauri, invokeTauriBytes } from "../../../lib/tauri/core-api";
 import type {
   MissionDraft,
   MissionDraftReview,
@@ -91,9 +91,9 @@ export async function showMissionDraft(id: string) {
   return parseDraft(response.draft);
 }
 export async function importMissionDraft(file: File) {
-  const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+  const bytes = new Uint8Array(await file.arrayBuffer());
   const response = record(
-    await invokeTauri("mission_draft_import", { fileBytes: bytes }),
+    await invokeTauriBytes("mission_draft_import", bytes),
     "import",
   );
   return review(response.draft);

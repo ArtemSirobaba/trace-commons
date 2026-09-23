@@ -12,6 +12,7 @@ import { useAccountQueryLifecycle } from "./hooks/use-account-query-lifecycle";
 import { useDaemonQueryEvents } from "./hooks/use-daemon-query-events";
 import { useDesktopEvents } from "./hooks/use-desktop-events";
 import { QuitConfirmation } from "./quit-confirmation";
+import { DaemonStartupNotice } from "./daemon-startup-notice";
 import { routeIdFromPath } from "./routes";
 
 export function AppShell() {
@@ -39,9 +40,7 @@ export function AppShell() {
   const requiresOnboarding =
     (core.data?.daemon.logged_in === false ||
       (core.data?.daemon.logged_in === true && !onboarding.isComplete)) &&
-    route !== null &&
-    route !== "insights" &&
-    route !== "mission-drafts";
+    route !== null;
 
   return (
     <SidebarProvider>
@@ -61,6 +60,7 @@ export function AppShell() {
               {error}
             </p>
           ))}
+          <DaemonStartupNotice startup={core.data?.startup} />
           <AppRoutes
             requiresOnboarding={requiresOnboarding}
             core={core}

@@ -55,6 +55,10 @@ export async function getCoreStatus(): Promise<CoreStatus> {
   return parseCoreStatus(await tauriInvoke("core_status"));
 }
 
+export async function retryDaemonStartup(): Promise<void> {
+  await invokeTauriVoid("retry_daemon_startup");
+}
+
 export function isTauriRuntime(): boolean {
   return isTauri();
 }
@@ -79,6 +83,29 @@ export function invokeTauri(
   args: Record<string, unknown> = {},
 ): Promise<unknown> {
   return tauriInvoke(command, args);
+}
+
+export function invokeTauriBytes(
+  command: string,
+  body: Uint8Array,
+  headers: Record<string, string> = {},
+): Promise<unknown> {
+  if (!isTauri()) throw new Error("Rust core is available only inside Tauri");
+  for (const [name, value] of Object.entries(headers)) {
+    if (
+      name.length > 128 ||
+      !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) ||
+      value.length > 128 ||
+      !/^[\x20-\x7e]*$/.test(value)
+    ) {
+      throw new Error("Invalid raw upload header");
+    }
+  }
+  return invoke<unknown>(command, body, { headers }).catch(
+    (error: unknown) => {
+      throw normalizeInvokeError(error);
+    },
+  );
 }
 
 export async function invokeTauriVoid(

@@ -5,6 +5,7 @@ import { useCoreStatus } from "../../../lib/tauri/use-core-status";
 import { waitingKeys } from "../api/query-keys";
 import type { UndoScope } from "../api/undo-api";
 import { approveWaitingProject } from "../api/waiting-api";
+import type { OutcomeVerdict } from "../types";
 
 export function useWaitingBulkApproval(
   onApproved?: (scope: UndoScope) => void,
@@ -13,8 +14,12 @@ export function useWaitingBulkApproval(
   const core = useCoreStatus();
   const queryClient = useQueryClient();
   const mutation = useMutation({
-    mutationFn: (projectId: string) => approveWaitingProject(projectId),
-    onSuccess: async (result, projectId) => {
+    mutationFn: ({ projectId, outcome }: {
+      projectId: string;
+      label: string;
+      outcome?: OutcomeVerdict;
+    }) => approveWaitingProject(projectId, outcome),
+    onSuccess: async (result, { projectId, label }) => {
       const excluded = result.excluded_ineligible
         ? ` ${result.excluded_ineligible} not eligible.`
         : "";
@@ -23,7 +28,7 @@ export function useWaitingBulkApproval(
           kind: "project",
           id: projectId,
           hold_until: result.hold_until,
-          label: projectId,
+          label,
         });
       setMessages((current) => ({
         ...current,
@@ -43,10 +48,14 @@ export function useWaitingBulkApproval(
       ]);
     },
   });
-  const approve = async (projectId: string) => {
+  const approve = async (
+    projectId: string,
+    label: string,
+    outcome?: OutcomeVerdict,
+  ) => {
     setMessages((current) => ({ ...current, [projectId]: "" }));
     try {
-      await mutation.mutateAsync(projectId);
+      await mutation.mutateAsync({ projectId, label, outcome });
     } catch {
       setMessages((current) => ({
         ...current,
@@ -55,7 +64,9 @@ export function useWaitingBulkApproval(
     }
   };
   return {
-    busyId: mutation.isPending ? (mutation.variables ?? null) : null,
+    busyId: mutation.isPending
+      ? (mutation.variables?.projectId ?? null)
+      : null,
     messages,
     approve,
     mutation,

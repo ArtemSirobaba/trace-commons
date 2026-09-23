@@ -1,8 +1,14 @@
 import {
   daemonCall,
+  invokeTauri,
   invokeTauriDiscardResult,
 } from "../../../lib/tauri/core-api";
 import type { PublicProfile } from "../types";
+
+export type ProfilePublishResult = {
+  profile: PublicProfile;
+  handlePersisted: boolean;
+};
 
 function parseProfile(value: unknown): PublicProfile {
   if (typeof value !== "object" || value === null)
@@ -31,7 +37,16 @@ export async function getPublicProfile() {
 }
 
 export async function publishProfile(handle: string, bio: string | null) {
-  return invokeTauriDiscardResult("publish_profile", { handle, bio });
+  const value = await invokeTauri("publish_profile", { handle, bio });
+  if (typeof value !== "object" || value === null)
+    throw new Error("Invalid profile publish response");
+  const record = value as Record<string, unknown>;
+  if (typeof record.handle_persisted !== "boolean")
+    throw new Error("Invalid profile publish field: handle_persisted");
+  return {
+    profile: parseProfile(record),
+    handlePersisted: record.handle_persisted,
+  } satisfies ProfilePublishResult;
 }
 
 export async function withdrawProfile() {

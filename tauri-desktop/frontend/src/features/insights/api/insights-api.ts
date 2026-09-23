@@ -1,4 +1,4 @@
-import { invokeTauri } from "../../../lib/tauri/core-api";
+import { invokeTauri, invokeTauriBytes } from "../../../lib/tauri/core-api";
 import type {
   Insight,
   InsightMetric,
@@ -224,12 +224,11 @@ export async function analyzeInsight(
   source: string,
   save: boolean,
 ) {
-  const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+  const bytes = new Uint8Array(await file.arrayBuffer());
   const response = record(
-    await invokeTauri("analyze_insight", {
-      source,
-      save,
-      fileBytes: bytes,
+    await invokeTauriBytes("analyze_insight", bytes, {
+      "x-tc-source": source,
+      "x-tc-save": String(save),
     }),
     "analyze",
   );
@@ -273,9 +272,11 @@ export async function clearInsightAnnotation(id: string) {
 }
 
 export async function linkTestReport(id: string, file: File) {
-  const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+  const bytes = new Uint8Array(await file.arrayBuffer());
   const response = record(
-    await invokeTauri("link_test_report", { id, fileBytes: bytes }),
+    await invokeTauriBytes("link_test_report", bytes, {
+      "x-tc-insight-id": id,
+    }),
     "test report evidence",
   );
   return parseInsight(response.insight);

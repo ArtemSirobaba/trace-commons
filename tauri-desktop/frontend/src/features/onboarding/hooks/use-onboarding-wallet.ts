@@ -57,7 +57,7 @@ export function useOnboardingWallet(onEnrolled: () => void) {
         setFlow(next);
         if (action === "start" && next.browser_url) {
           try {
-            await openNativeWalletUrl(next.browser_url, commons.trim());
+            await openNativeWalletUrl(next.browser_url);
           } catch (error) {
             const cancelled = await nativeWalletFlow({
               action: "cancel",

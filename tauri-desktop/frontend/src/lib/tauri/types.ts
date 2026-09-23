@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const coreStatusSchema = z.object({
   state_dir: z.string(),
-  startup: z.enum(["running", "needs_roots"]),
+  startup: z.enum(["running", "needs_roots", "daemon_unavailable"]),
   daemon: z.object({
     schema_version: z.string(),
     logged_in: z.boolean(),

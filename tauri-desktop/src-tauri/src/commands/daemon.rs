@@ -1,6 +1,7 @@
-use tauri::State;
+use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::{
+    app::start_event_bridge,
     ipc::{
         READ_ONLY_METHODS, bootstrap_profile, bootstrap_settings, call_daemon,
         optional_shared_state, shared_state,
@@ -9,13 +10,75 @@ use crate::{
 };
 
 #[tauri::command]
-pub(crate) fn core_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    state_core_status(&state)
+pub(crate) async fn retry_daemon_startup<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::runtime::ensure_daemon_started(&state).await?;
+    start_event_bridge(app);
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) async fn core_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        state_core_status(&state)
+    })
+    .await
+    .map_err(|_| "core-status-unavailable".to_owned())?
 }
 
 #[tauri::command]
 pub(crate) fn queue_outcome_line(label: String) -> String {
     trace_commons_contributor::private_inference_copy::queue_outcome_line(&label).to_owned()
+}
+
+#[tauri::command]
+pub(crate) fn residual_secret_line(count: u32, sites: Vec<String>) -> String {
+    trace_commons_contributor::preview_copy::residual_secret_line(count, &sites)
+}
+
+#[tauri::command]
+pub(crate) fn redaction_summary_copy(
+    redactions: std::collections::BTreeMap<String, u32>,
+    distinct: Option<std::collections::BTreeMap<String, u32>>,
+) -> serde_json::Value {
+    let (removed, still_present) = trace_commons_contributor::redaction_summary::rows(
+        &redactions,
+        &distinct.unwrap_or_default(),
+    );
+    serde_json::json!({
+        "removed": removed,
+        "still_present": still_present,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn project_ignore_copy(project_label: String, pending: usize) -> serde_json::Value {
+    use trace_commons_contributor::project_copy;
+
+    serde_json::json!({
+        "title": project_copy::ignore_project_title(&project_label),
+        "body": project_copy::ignore_project_body(pending),
+        "button": project_copy::IGNORE_PROJECT,
+        "tooltip": project_copy::IGNORE_PROJECT_TOOLTIP,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn arming_offer_copy(project_label: String, count: u32) -> serde_json::Value {
+    use trace_commons_contributor::project_copy;
+
+    serde_json::json!({
+        "evidence": project_copy::arming_offer_evidence(&project_label, count),
+        "question": project_copy::arming_offer_question(&project_label),
+        "confirm": project_copy::ARMING_OFFER_CONFIRM,
+        "decline": project_copy::ARMING_OFFER_DECLINE,
+        "body": project_copy::ARMING_BODY,
+    })
 }
 
 #[tauri::command]
@@ -50,6 +113,36 @@ pub(crate) fn certificate_copy(evidence_admitted: bool) -> serde_json::Value {
         "list_title": trace_commons_contributor::private_inference_copy::certificate_list_title(evidence_admitted),
         "row_line": trace_commons_contributor::private_inference_copy::certificate_row_line(evidence_admitted),
         "list_empty": copy.certificate_list_empty,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn eligibility_copy(label: String, reason: Option<String>) -> serde_json::Value {
+    use trace_commons_contributor::private_inference_copy::{
+        ContributionControl, eligibility_control, eligibility_reason_line, eligibility_state_line,
+    };
+
+    serde_json::json!({
+        "state_line": eligibility_state_line(&label),
+        "reason_line": reason.as_deref().map(eligibility_reason_line).unwrap_or_default(),
+        "can_contribute": eligibility_control(&label) == ContributionControl::Contribute,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn eligibility_group_copy(
+    pending: u64,
+    contributable: Option<u64>,
+) -> serde_json::Value {
+    use trace_commons_contributor::private_inference_copy::{
+        ContributionControl, group_control, group_withheld_line,
+    };
+
+    let eligible = contributable.unwrap_or(pending).min(pending);
+    serde_json::json!({
+        "can_contribute": group_control(pending, contributable.map(|_| eligible)) == ContributionControl::Contribute,
+        "eligible_count": eligible,
+        "withheld_line": group_withheld_line(pending.saturating_sub(eligible)),
     })
 }
 
@@ -110,26 +203,30 @@ pub(crate) async fn dismiss_entry(
 pub(crate) async fn approve_entry(
     state: State<'_, AppState>,
     entry_id: String,
+    outcome: Option<String>,
+    correction: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    call_daemon(
-        shared_state(&state)?,
-        "approve",
-        serde_json::json!({ "entry_id": entry_id }),
-    )
-    .await
+    let mut params = serde_json::json!({ "entry_id": entry_id });
+    if let Some(outcome) = outcome {
+        params["outcome"] = serde_json::json!(outcome);
+    }
+    if let Some(correction) = correction {
+        params["correction"] = serde_json::json!(correction);
+    }
+    call_daemon(shared_state(&state)?, "approve", params).await
 }
 
 #[tauri::command]
 pub(crate) async fn approve_project(
     state: State<'_, AppState>,
     project_id: String,
+    outcome: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    call_daemon(
-        shared_state(&state)?,
-        "approve",
-        serde_json::json!({ "project_id": project_id }),
-    )
-    .await
+    let mut params = serde_json::json!({ "project_id": project_id });
+    if let Some(outcome) = outcome {
+        params["outcome"] = serde_json::json!(outcome);
+    }
+    call_daemon(shared_state(&state)?, "approve", params).await
 }
 
 #[tauri::command]

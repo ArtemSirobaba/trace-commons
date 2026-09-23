@@ -1,4 +1,7 @@
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
+import { ResponsiveOverlay } from "../../../components/responsive-overlay";
+import { useArmingOfferCopy } from "../../../lib/tauri/use-contributor-copy";
 import type { ArmingOffer as ArmingOfferData } from "../api/arming-api";
 
 export function ArmingOffer({
@@ -14,6 +17,11 @@ export function ArmingOffer({
   onAccept: () => void;
   onDecline: () => void;
 }) {
+  const [confirming, setConfirming] = useState(false);
+  const copy = useArmingOfferCopy(
+    offer?.project_label ?? "",
+    offer?.contributed_count ?? 0,
+  );
   if (!offer && !error) return null;
   return (
     <section className="mb-4 rounded-2xl border border-border bg-card/80 p-[22px_26px]">
@@ -22,28 +30,39 @@ export function ArmingOffer({
       </span>
       {offer && (
         <>
-          <h2>Keep asking about {offer.project_label}?</h2>
-          <p>
-            This project has contributed {offer.contributed_count} times. Enable
-            automatic contribution for this project, or keep reviewing each
-            session.
-          </p>
+          {copy.data ? (
+            <>
+              <p className="m-0 text-[12px] text-muted-foreground">
+                {copy.data.evidence}
+              </p>
+              <h2>{copy.data.question}</h2>
+              <p className="whitespace-pre-line text-[12px] leading-[1.55] text-muted-foreground">
+                {copy.data.body}
+              </p>
+            </>
+          ) : (
+            <p className="text-[12px] text-destructive">
+              {copy.isError
+                ? "Shared arming copy unavailable. Automation is disabled."
+                : "Loading automatic contribution disclosure…"}
+            </p>
+          )}
           <div className="mt-6 flex gap-2.5">
             <Button
               className="rounded-lg border-0 bg-primary px-3.5 py-2.5 text-[12px] font-bold text-primary-foreground hover:bg-primary/80"
               type="button"
-              onClick={onAccept}
-              disabled={busy}
+              onClick={() => setConfirming(true)}
+              disabled={busy || !copy.data}
             >
-              Enable automatic contribution
+              {copy.data?.confirm ?? "Loading…"}
             </Button>
             <Button
               className="rounded-[7px] border border-border bg-background px-[11px] py-2 text-[11px] font-bold text-foreground hover:border-primary hover:text-primary"
               type="button"
               onClick={onDecline}
-              disabled={busy}
+              disabled={busy || !copy.data}
             >
-              Not now
+              {copy.data?.decline ?? "Loading…"}
             </Button>
           </div>
         </>
@@ -52,6 +71,40 @@ export function ArmingOffer({
         <p className="-mt-[18px] mb-[18px] rounded-[9px] border border-destructive/30 bg-destructive/10 px-3.5 py-3 text-[12px] text-destructive">
           {error}
         </p>
+      )}
+      {offer && copy.data && (
+        <ResponsiveOverlay
+          open={confirming}
+          onOpenChange={setConfirming}
+          title={copy.data.question}
+          description={copy.data.body}
+          footer={
+            <div className="flex justify-end gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setConfirming(false)}
+                disabled={busy}
+              >
+                {copy.data.decline}
+              </Button>
+              <Button
+                type="button"
+                onClick={() => {
+                  setConfirming(false);
+                  onAccept();
+                }}
+                disabled={busy}
+              >
+                {copy.data.confirm}
+              </Button>
+            </div>
+          }
+        >
+          <p className="m-0 text-[12px] text-muted-foreground">
+            {copy.data.evidence}
+          </p>
+        </ResponsiveOverlay>
       )}
     </section>
   );
